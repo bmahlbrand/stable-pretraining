@@ -17,6 +17,13 @@ Unreleased
   mix ``(1 - lamb) * invariance + lamb * visreg``. Registered in
   ``stable_pretraining.methods`` and ``METHODS.md``, with an Imagenette
   ViT-S/16 benchmark under ``benchmarks/imagenet10/visreg-vit-small.py``.
+- ``HLeWM`` (Hierarchical LeWorldModel): a JEPA world model trained end to end
+  with LeWorldModel's next-embedding prediction loss plus SIGReg, where each
+  frame is embedded as a pyramid of token levels (64/16/4 tokens by default)
+  and the predictor follows MilliVid's coarse-to-fine rollout schedule.
+  Includes ``HierarchicalSchedule`` (MilliVid and full-resolution baseline
+  schedules), per-level SIGReg, and ``HLeWM.rollout`` for embedding-space
+  rollouts. Registered in ``stable_pretraining.methods`` and ``METHODS.md``.
 
 **Discoverability improvements**
 
