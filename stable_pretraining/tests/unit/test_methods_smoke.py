@@ -244,6 +244,26 @@ def test_lejepa_forward_backward():
     _assert_loss_and_backward(model, output)
 
 
+def test_hlewm_forward_backward():
+    model = M.HLeWM(
+        image_size=32,
+        patch_size=4,
+        embed_dim=32,
+        encoder_depth=2,
+        predictor_depth=2,
+        projector_hidden_dim=64,
+        num_frames_per_level=(1, 4, 16),
+        extra_budget=64,
+        n_slices=64,
+        n_points=5,
+    )
+    model.train()
+    g = torch.Generator().manual_seed(3)
+    video = torch.randn(B, model.schedule.chunk_num_frames, C, 32, 32, generator=g)
+    output = model(video)
+    _assert_loss_and_backward(model, output)
+
+
 def test_visreg_forward_backward():
     model = M.VISReg(
         encoder_name=TINY_VIT,
