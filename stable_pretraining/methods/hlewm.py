@@ -285,6 +285,17 @@ def _sincos(positions: torch.Tensor, dim: int) -> torch.Tensor:
     return F.pad(features, (0, dim - features.shape[-1]))
 
 
+def _token_centers(rowcol: torch.Tensor, level: torch.Tensor) -> torch.Tensor:
+    """Token centers ``[..., 2]`` in finest-level token units.
+
+    Level ``l`` tokens cover ``2**l`` finest-level tokens per side, so a coarse
+    token sits at the center of the fine tokens it covers and positions line up
+    across levels.
+    """
+    scale = (2.0 ** level.float()).unsqueeze(-1)
+    return rowcol.float() * scale + (scale - 1) / 2
+
+
 def _patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
     n, c, h, w = images.shape
     p = patch_size
@@ -383,7 +394,8 @@ class HierarchicalFrameEncoder(nn.Module):
     The frame is downsampled by 2 per level and every level is patchified with
     the same patch size and shared patch weights, so level ``l`` has
     ``(image_size / patch_size / 2**l) ** 2`` tokens. All levels go through one
-    transformer, with a learned level embedding and 2D sine-cosine positions.
+    transformer, with a learned level embedding and 2D sine-cosine positions of
+    each token's center in finest-level token units.
 
     Args:
         image_size: Input height and width.
@@ -443,7 +455,9 @@ class HierarchicalFrameEncoder(nn.Module):
         self.register_buffer("token_level", torch.cat(levels), persistent=False)
         self.register_buffer(
             "token_rowcol",
-            torch.stack([torch.cat(rows), torch.cat(cols)], -1),
+            _token_centers(
+                torch.stack([torch.cat(rows), torch.cat(cols)], -1), self.token_level
+            ),
             persistent=False,
         )
 
@@ -479,9 +493,11 @@ class HierarchicalPredictor(nn.Module):
     """Predicts target-level embeddings from scheduled multi-level context.
 
     Context tokens carry their embeddings; target tokens start from a learned
-    query. Every token gets 3D sine-cosine positions over (frame, row, column)
-    and per-token AdaLN conditioning on its level, its role (context or
-    target) and, optionally, its frame's action.
+    query. Every token gets 3D sine-cosine positions over (frame, row, column),
+    with row and column measured at its center in finest-level token units so
+    tokens of different levels line up spatially, and per-token AdaLN
+    conditioning on its level, its role (context or target) and, optionally,
+    its frame's action.
 
     Args:
         embed_dim: Embedding size of context and predicted tokens.
@@ -558,7 +574,10 @@ class HierarchicalPredictor(nn.Module):
             ],
             dim=1,
         )
-        x = x + _sincos(index[:, [0, 2, 3]], x.shape[-1]).to(x.dtype)
+        positions = torch.cat(
+            [index[:, :1].float(), _token_centers(index[:, 2:], index[:, 1])], dim=1
+        )
+        x = x + _sincos(positions, x.shape[-1]).to(x.dtype)
 
         role = torch.zeros(index.shape[0], dtype=torch.long, device=index.device)
         role[num_context:] = 1
@@ -631,10 +650,10 @@ class HLeWM(Module):
     through both the context and the target embeddings, as in LeWorldModel.
 
     SIGReg follows LeWorldModel: for each level and each (frame, token)
-    position, the Epps-Pulley test runs across the batch. Up to
-    ``sigreg_max_positions`` positions per level are sampled per call to bound
-    memory. Because the test's samples are batch elements, the batch size
-    matters; LeWorldModel used 128.
+    position that the step's context or targets use, the Epps-Pulley test runs
+    across the batch. Up to ``sigreg_max_positions`` positions per level are
+    sampled per call to bound memory. Because the test's samples are batch
+    elements, the batch size matters; LeWorldModel used 128.
 
     Args:
         image_size: Frame height and width.
@@ -822,6 +841,13 @@ class HLeWM(Module):
                     if index
                     else torch.zeros((0, 4), dtype=torch.long, device=device)
                 )
+            used: dict[int, list] = {}
+            for level, _, rows, _ in parts[CONTEXT] + parts[TARGET]:
+                used.setdefault(level, []).append(rows)
+            layout["sigreg"] = [
+                (level, torch.as_tensor(np.unique(np.concatenate(r)), device=device))
+                for level, r in sorted(used.items())
+            ]
             self._step_cache[key] = layout
         return self._step_cache[key]
 
@@ -914,9 +940,12 @@ class HLeWM(Module):
         )
 
         pred_loss = F.mse_loss(prediction, target)
-        # Levels the schedule never uses (the full-resolution baseline) would get
-        # SIGReg pressure but no prediction pressure, so leave them out.
-        sigreg_loss = self._sigreg(levels[: self.schedule.num_levels])
+        # Embeddings outside the step's context and targets get no prediction
+        # pressure, so SIGReg alone would shape them; a coarse step encodes
+        # every frame of the chunk but uses one finest-level frame.
+        sigreg_loss = self._sigreg(
+            [levels[level][:, rows] for level, rows in layout["sigreg"]]
+        )
         pooled = tuple(z.detach().mean(dim=(1, 2)) for z in levels)
         return HLeWMOutput(
             loss=pred_loss + self.lamb * sigreg_loss,

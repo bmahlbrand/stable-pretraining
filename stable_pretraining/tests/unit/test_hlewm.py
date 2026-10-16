@@ -8,8 +8,10 @@ from stable_pretraining.methods import HLeWM
 from stable_pretraining.methods.hlewm import (
     CONTEXT,
     TARGET,
+    UNSEEN,
     HierarchicalFrameEncoder,
     HierarchicalSchedule,
+    _token_centers,
 )
 
 pytestmark = pytest.mark.unit
@@ -148,6 +150,19 @@ def test_separate_levels_ignore_finer_detail():
         assert not torch.allclose(joint(images)[2], joint(images + checker)[2])
 
 
+def test_token_centers_line_up_across_levels():
+    """A coarser token sits at the center of the finer tokens it covers."""
+    centers = _token_centers(torch.tensor([[0, 0], [1, 1], [0, 1]]), torch.arange(3))
+    assert centers.tolist() == [[0.0, 0.0], [2.5, 2.5], [1.5, 5.5]]
+
+    encoder = HierarchicalFrameEncoder(
+        32, 4, 3, dim=32, depth=1, heads=2, embed_dim=16, projector_hidden_dim=32
+    )
+    fine = encoder.token_rowcol[encoder.token_level == 0]
+    coarse = encoder.token_rowcol[encoder.token_level == 2]
+    assert torch.allclose(coarse[0], fine[(fine < 4).all(-1)].mean(0))
+
+
 def test_encoder_rejects_indivisible_size():
     with pytest.raises(ValueError):
         HierarchicalFrameEncoder(36, 4, 3)
@@ -175,6 +190,25 @@ def test_every_schedule_step_runs():
         output = model(video, step_index=step)
         assert torch.isfinite(output.loss), step
         assert output.step_index == step
+
+
+def test_sigreg_sees_only_embeddings_the_step_uses(monkeypatch):
+    model = _tiny().train()
+    video = _video(model, batch=2, extra_frames=0)
+    seen = []
+
+    def record(levels):
+        seen.append([z.shape[1] for z in levels])
+        return torch.zeros(())
+
+    monkeypatch.setattr(model, "_sigreg", record)
+    for step in (0, 2):
+        seen.clear()
+        model(video, step_index=step)
+        used = (model.schedule.selections[step] != UNSEEN).sum(axis=1)
+        # A coarse step encodes every chunk frame but uses one fine frame.
+        assert seen == [[int(n) for n in used if n > 0]]
+        assert used[0] < used.max()
 
 
 def test_full_resolution_baseline_matches_budget():
