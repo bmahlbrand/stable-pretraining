@@ -163,6 +163,24 @@ def test_token_centers_line_up_across_levels():
     assert torch.allclose(coarse[0], fine[(fine < 4).all(-1)].mean(0))
 
 
+def test_forward_levels_matches_full_encoding():
+    torch.manual_seed(0)
+    encoder = HierarchicalFrameEncoder(
+        32, 4, 3, dim=32, depth=2, heads=2, embed_dim=16, projector_hidden_dim=32
+    ).eval()
+    frames = torch.randn(5, 3, 32, 32)
+    with torch.no_grad():
+        full = encoder(frames)
+        partial = encoder.forward_levels({0: frames[:2], 2: frames[1:4]})
+    assert set(partial) == {0, 2}
+    assert torch.allclose(partial[0], full[0][:2], atol=1e-5)
+    assert torch.allclose(partial[2], full[2][1:4], atol=1e-5)
+
+    joint = HierarchicalFrameEncoder(32, 4, 3, dim=32, level_attention="joint")
+    with pytest.raises(ValueError):
+        joint.forward_levels({0: frames})
+
+
 def test_encoder_rejects_indivisible_size():
     with pytest.raises(ValueError):
         HierarchicalFrameEncoder(36, 4, 3)
@@ -209,6 +227,27 @@ def test_sigreg_sees_only_embeddings_the_step_uses(monkeypatch):
         # A coarse step encodes every chunk frame but uses one fine frame.
         assert seen == [[int(n) for n in used if n > 0]]
         assert used[0] < used.max()
+
+
+def test_step_embeddings_match_full_encoding():
+    """Encoding only the used (level, frame) pairs changes no embedding."""
+    model = _tiny().eval()
+    video = _video(model, batch=2, extra_frames=0)
+    for step in (0, 2):
+        layout = model._step_layout(step, video.device)
+        clip = video[:, layout["visible"]]
+        with torch.no_grad():
+            encoded = model._encode_used(clip, layout["used"])
+            full = model.encode(clip)
+        for level, rows in layout["used"]:
+            assert torch.allclose(encoded[level], full[level][:, rows], atol=1e-5)
+
+
+def test_joint_attention_model_trains():
+    model = _tiny(level_attention="joint").train()
+    output = model(_video(model, batch=2, extra_frames=0), step_index=2)
+    output.loss.backward()
+    assert torch.isfinite(output.loss)
 
 
 def test_full_resolution_baseline_matches_budget():

@@ -488,6 +488,43 @@ class HierarchicalFrameEncoder(nn.Module):
         x = _apply_tokenwise(self.projector, self.norm(x))
         return list(x.split(self.tokens_per_level, dim=1))
 
+    def forward_levels(
+        self, frames: dict[int, torch.Tensor]
+    ) -> dict[int, torch.Tensor]:
+        """Embed each given level from its own frames only.
+
+        With ``level_attention="separate"`` the levels never interact, so a
+        level can be encoded from just the frames that need it. In eval mode
+        the result equals the matching levels of :meth:`forward`; in training
+        the projector's BatchNorm sees only the requested tokens.
+
+        Args:
+            frames: Level index to images ``[N_l, C, H, W]``.
+
+        Returns:
+            Level index to embeddings ``[N_l, tokens_l, embed_dim]``.
+        """
+        if self.level_attention != "separate":
+            raise ValueError("forward_levels needs level_attention='separate'.")
+        features, shapes = [], []
+        for level, x in frames.items():
+            for _ in range(level):
+                x = F.avg_pool2d(x, 2)
+            x = self.patch_embed(_patchify(x, self.patch_size))
+            rowcol = self.token_rowcol[self.token_level == level]
+            x = x + _sincos(rowcol, x.shape[-1]).to(x.dtype)
+            x = x + self.level_embedding.weight[level]
+            for block in self.blocks:
+                x = block(x)
+            shapes.append(x.shape[:2])
+            features.append(self.norm(x).flatten(0, 1))
+        projected = self.projector(torch.cat(features))
+        sizes = [n * t for n, t in shapes]
+        return {
+            level: z.reshape(*shape, -1)
+            for level, z, shape in zip(frames, projected.split(sizes), shapes)
+        }
+
 
 class HierarchicalPredictor(nn.Module):
     """Predicts target-level embeddings from scheduled multi-level context.
@@ -608,9 +645,10 @@ class HLeWMOutput(ModelOutput):
     :ivar loss: ``pred_loss + lamb * sigreg_loss``.
     :ivar pred_loss: MSE between predicted and encoded target embeddings.
     :ivar sigreg_loss: SIGReg statistic, averaged over levels.
-    :ivar embedding: Detached finest-level embedding, mean-pooled over tokens
-        and frames ``[B, embed_dim]``, for probes.
-    :ivar level_embeddings: Detached pooled embedding per level, finest first.
+    :ivar embedding: Detached finest-level embedding ``[B, embed_dim]``,
+        mean-pooled over the tokens and frames the step uses, for probes.
+    :ivar level_embeddings: The same per level, finest first; ``None`` for a
+        level the step does not use.
     :ivar step_index: Schedule step used for the prediction loss.
     """
 
@@ -645,8 +683,9 @@ class HLeWM(Module):
         - **Loss**: ``pred_loss + lamb * mean_l SIGReg(level_l)``
 
     Each training call samples one schedule step (groups weighted equally, as
-    in MilliVid), takes a ``chunk_num_frames`` window of the clip, encodes the
-    frames that step uses, and predicts the step's targets. Gradients flow
+    in MilliVid), takes a ``chunk_num_frames`` window of the clip, encodes each
+    level only for the frames where the step uses it, and predicts the step's
+    targets. Gradients flow
     through both the context and the target embeddings, as in LeWorldModel.
 
     SIGReg follows LeWorldModel: for each level and each (frame, token)
@@ -822,16 +861,30 @@ class HLeWM(Module):
                     index = np.concatenate([f - first, np.full_like(f, level), ij], -1)
                     rows = np.array([row_of_frame[int(x)] for x in frames])
                     parts[role].append((level, frames, rows, index.reshape(-1, 4)))
+            used: dict[int, list] = {}
+            for level, _, rows, _ in parts[CONTEXT] + parts[TARGET]:
+                used.setdefault(level, []).append(rows)
+            used = {
+                lvl: np.unique(np.concatenate(r)) for lvl, r in sorted(used.items())
+            }
             layout = {
                 "visible": torch.as_tensor(visible, device=device),
                 "first": first,
+                # Rows of ``visible`` that each level's context or targets use.
+                "used": [
+                    (level, torch.as_tensor(rows, device=device))
+                    for level, rows in used.items()
+                ],
             }
             for role, name in ((CONTEXT, "context"), (TARGET, "target")):
+                # (level, chunk frames, position of each frame among used rows)
                 layout[name] = [
                     (
                         level,
                         torch.as_tensor(frames, device=device),
-                        torch.as_tensor(rows, device=device),
+                        torch.as_tensor(
+                            np.searchsorted(used[level], rows), device=device
+                        ),
                     )
                     for level, frames, rows, _ in parts[role]
                 ]
@@ -841,13 +894,6 @@ class HLeWM(Module):
                     if index
                     else torch.zeros((0, 4), dtype=torch.long, device=device)
                 )
-            used: dict[int, list] = {}
-            for level, _, rows, _ in parts[CONTEXT] + parts[TARGET]:
-                used.setdefault(level, []).append(rows)
-            layout["sigreg"] = [
-                (level, torch.as_tensor(np.unique(np.concatenate(r)), device=device))
-                for level, r in sorted(used.items())
-            ]
             self._step_cache[key] = layout
         return self._step_cache[key]
 
@@ -864,14 +910,26 @@ class HLeWM(Module):
         levels = self.encoder(video.flatten(0, 1))
         return [z.reshape(b, t, *z.shape[1:]) for z in levels]
 
-    def _gather(self, levels: Sequence[torch.Tensor], parts: list) -> torch.Tensor:
-        b = levels[0].shape[0]
+    def _encode_used(self, clip: torch.Tensor, used: list) -> dict:
+        """Embeddings ``[B, rows_l, tokens_l, D]`` of the rows each level uses."""
+        b = clip.shape[0]
+        if self.encoder.level_attention == "separate":
+            frames = {level: clip[:, rows].flatten(0, 1) for level, rows in used}
+            encoded = self.encoder.forward_levels(frames)
+            return {
+                level: z.reshape(b, -1, *z.shape[1:]) for level, z in encoded.items()
+            }
+        levels = self.encode(clip)
+        return {level: levels[level][:, rows] for level, rows in used}
+
+    def _gather(self, encoded: dict, parts: list) -> torch.Tensor:
+        b = next(iter(encoded.values())).shape[0]
         tokens = [
-            levels[level][:, rows].reshape(b, -1, self.embed_dim)
-            for level, _, rows in parts
+            encoded[level][:, local].reshape(b, -1, self.embed_dim)
+            for level, _, local in parts
         ]
         if not tokens:
-            return levels[0].new_zeros(b, 0, self.embed_dim)
+            return next(iter(encoded.values())).new_zeros(b, 0, self.embed_dim)
         return torch.cat(tokens, dim=1)
 
     def _sigreg(self, levels: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -926,10 +984,13 @@ class HLeWM(Module):
             step_index = self.schedule.sample_step()
         layout = self._step_layout(step_index, video.device)
 
-        frames = layout["visible"] + offset
-        levels = self.encode(video[:, frames])
-        context = self._gather(levels, layout["context"])
-        target = self._gather(levels, layout["target"])
+        # A step uses few of the (level, frame) pairs in its chunk, e.g. a coarse
+        # step uses one finest-level frame, so only those are encoded.
+        encoded = self._encode_used(
+            video[:, layout["visible"] + offset], layout["used"]
+        )
+        context = self._gather(encoded, layout["context"])
+        target = self._gather(encoded, layout["target"])
 
         step_actions = None
         if actions is not None:
@@ -940,13 +1001,13 @@ class HLeWM(Module):
         )
 
         pred_loss = F.mse_loss(prediction, target)
-        # Embeddings outside the step's context and targets get no prediction
-        # pressure, so SIGReg alone would shape them; a coarse step encodes
-        # every frame of the chunk but uses one finest-level frame.
-        sigreg_loss = self._sigreg(
-            [levels[level][:, rows] for level, rows in layout["sigreg"]]
+        # SIGReg covers the same embeddings: any others would get SIGReg
+        # pressure but no prediction pressure.
+        sigreg_loss = self._sigreg(list(encoded.values()))
+        pooled = tuple(
+            encoded[level].detach().mean(dim=(1, 2)) if level in encoded else None
+            for level in range(self.num_levels)
         )
-        pooled = tuple(z.detach().mean(dim=(1, 2)) for z in levels)
         return HLeWMOutput(
             loss=pred_loss + self.lamb * sigreg_loss,
             pred_loss=pred_loss,
