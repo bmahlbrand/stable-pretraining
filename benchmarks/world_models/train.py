@@ -1,10 +1,16 @@
-"""Train and evaluate a world model on Moving MNIST.
+"""Train and evaluate a world model on occluded four-digit Moving MNIST.
+
+Four MNIST digits bounce in a 64x64 frame with an opaque vertical band they
+can hide behind for many frames. The task needs both memory (a hidden digit's
+identity and motion) and more detail than one vector per frame easily holds,
+which is where a hierarchy of token levels should help.
 
 Compares HLeWM (MilliVid schedule), HLeWM's equal-budget full-resolution
-schedule, and a LeWorldModel baseline under one configuration: same widths and
-depths, batch size, step count, optimizer and evaluation. Training resumes from
-``<out>/ckpt.pt`` if it exists, so a run can be restarted with the same
-command.
+schedule, and a LeWorldModel baseline with a long history, with the same
+encoder and predictor widths and depths, batch size, step count, optimizer and
+evaluation. LeWM gets a larger per-frame embedding because it has one vector
+per frame instead of a token pyramid. Training resumes from ``<out>/ckpt.pt``
+if it exists, so a run can be restarted with the same command.
 
 Example::
 
@@ -34,8 +40,9 @@ from moving_mnist import MovingMNIST  # noqa: E402
 from utils import get_data_dir  # noqa: E402
 
 MODELS = ("hlewm", "hlewm-fullres", "lewm")
-SIZE, PATCH = 32, 8
-TOKENS_PER_LEVEL = (16, 4, 1)
+SIZE, PATCH = 64, 8
+DATA = {"size": SIZE, "digit_size": 16, "num_digits": 4, "occluder": (20, 44)}
+TOKENS_PER_LEVEL = (64, 16, 4)
 NUM_FRAMES_PER_LEVEL = (1, 4, 16)
 WIDTHS = {
     "embed_dim": 32,
@@ -54,7 +61,8 @@ WIDTHS = {
 def build(args):
     torch.manual_seed(args.seed)
     if args.model == "lewm":
-        return LeWM(SIZE, PATCH, 1, history=args.history, lamb=args.lamb, **WIDTHS)
+        widths = {**WIDTHS, "embed_dim": args.lewm_embed_dim}
+        return LeWM(SIZE, PATCH, 1, history=args.history, lamb=args.lamb, **widths)
     return HLeWM(
         image_size=SIZE,
         patch_size=PATCH,
@@ -77,6 +85,17 @@ def given_frames(args) -> int:
         NUM_FRAMES_PER_LEVEL, args.extra_budget, TOKENS_PER_LEVEL
     )
     return schedule.first_target_frame
+
+
+def eval_clips(root, given: int, args) -> dict:
+    """Random fit clips, then test clips where a hidden digit re-emerges."""
+    source = MovingMNIST(root, train=False, cell=PATCH, **DATA)
+    g = torch.Generator().manual_seed(1234)
+    frames = given + args.horizon
+    fit = source.sample(args.fit_clips, frames, g)
+    fit["reemerging"] = torch.zeros_like(fit["label"], dtype=torch.bool)
+    test = source.sample_reemerging(args.eval_clips - args.fit_clips, frames, given, g)
+    return {k: torch.cat([fit[k], test[k]]) for k in fit}
 
 
 def clip_frames(model) -> int:
@@ -111,7 +130,7 @@ def train(model, data, args, device, ckpt_path):
     running = {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
     t0 = time.time() - state["seconds"]
     for step in range(state["step"] + 1, args.steps + 1):
-        video = data.sample(args.batch, frames, g)["video"].to(device)
+        video = data.sample(args.batch, frames, g, maps=False)["video"].to(device)
         out = model(video)
         opt.zero_grad(set_to_none=True)
         out.loss.backward()
@@ -157,8 +176,9 @@ def main():
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lamb", type=float, default=0.09)
-    parser.add_argument("--extra-budget", type=int, default=48)
-    parser.add_argument("--history", type=int, default=4, help="LeWM context.")
+    parser.add_argument("--extra-budget", type=int, default=192)
+    parser.add_argument("--history", type=int, default=16, help="LeWM context.")
+    parser.add_argument("--lewm-embed-dim", type=int, default=128)
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--eval-clips", type=int, default=768)
     parser.add_argument("--fit-clips", type=int, default=512)
@@ -180,12 +200,11 @@ def main():
         f"{clip_frames(model)}-frame training clips, device {device}",
         flush=True,
     )
-    state = train(model, MovingMNIST(root, train=True), args, device, out / "ckpt.pt")
+    train_data = MovingMNIST(root, train=True, cell=PATCH, **DATA)
+    state = train(model, train_data, args, device, out / "ckpt.pt")
 
     given = given_frames(args)
-    data = MovingMNIST(root, train=False).sample(
-        args.eval_clips, given + args.horizon, torch.Generator().manual_seed(1234)
-    )
+    data = eval_clips(root, given, args)
     model.to("cpu")
     metrics = evaluate(model, data, given, args.horizon, args.fit_clips)
     print(f"\n== {args.model} seed {args.seed}, {given} given frames ==")
