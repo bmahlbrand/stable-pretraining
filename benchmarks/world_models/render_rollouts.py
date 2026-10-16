@@ -4,10 +4,11 @@ Usage::
 
     python benchmarks/world_models/render_rollouts.py RUN_DIR [RUN_DIR ...] --out clip.mp4
 
-Each run directory (from ``train.py``) becomes one row: the same held-out
-clips, the last given frames, then the rollout. A cross marks the digit
-position decoded from the finest level, a circle the coarsest level (HLeWM
-MilliVid only), and the label shows the decoded digit class. Needs ``ffmpeg``.
+Each run directory (from ``train.py``) becomes one row showing the same
+held-out test clips (each has a digit that re-emerges from behind the band
+during the rollout): the last given frames, then the rollout. Outlined cells
+are where the model's finest-level rollout, decoded by an occupancy probe,
+places a digit. Needs ``ffmpeg``.
 """
 
 import argparse
@@ -23,9 +24,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
-from evaluate import Ridge, encode_clips  # noqa: E402
-from moving_mnist import MovingMNIST  # noqa: E402
-from train import build, given_frames  # noqa: E402
+from evaluate import OccupancyProbe, encode_clips  # noqa: E402
+from moving_mnist import IGNORE  # noqa: E402
+from train import PATCH, build, eval_clips, given_frames  # noqa: E402
 from utils import get_data_dir  # noqa: E402
 
 TITLES = {
@@ -33,9 +34,9 @@ TITLES = {
     "hlewm-fullres": "HLeWM, full-res schedule",
     "lewm": "LeWM",
 }
-SCALE, GAP, HEAD, FOOT = 6, 10, 30, 8
-SURFACE, TEXT, TEXT2 = (252, 252, 251), (11, 11, 11), (82, 81, 78)
-FINE, COARSE = (235, 104, 52), (42, 120, 214)
+SCALE, GAP, HEAD, FOOT = 3, 10, 30, 8
+SURFACE, TEXT = (252, 252, 251), (11, 11, 11)
+PRED = (235, 104, 52)
 
 
 def flat(z):
@@ -49,61 +50,41 @@ def decode_run(run_dir: Path, data: dict, clips: list, num_fit: int, horizon: in
     model.load_state_dict(torch.load(run_dir / "model.pt", map_location="cpu"))
     model.eval()
     given = given_frames(args)
-    video, pos, label = data["video"], data["position"], data["label"]
-    levels = encode_clips(model, video[:num_fit])
-    onehot = torch.nn.functional.one_hot(label[:num_fit], 10).float()
-    onehot = onehot[:, None].expand(-1, video.shape[1], -1)
-    size = video.shape[-1]
+    fine = encode_clips(model, data["video"][:num_fit])[0]
+    owner = data["owner"][:num_fit].flatten(2)
+    probe = OccupancyProbe(flat(fine[:, ::2]), flat(owner[:, ::2]))
     with torch.no_grad():
-        rollout = model.rollout(video[clips][:, :given], num_frames=given + horizon)
-    decoded = []
-    for level in sorted({0, len(rollout.embeddings) - 1}):
-        z = rollout.embeddings[level]
-        pos_probe = Ridge(
-            flat(levels[level]), pos[:num_fit].reshape(-1, 2), bounds=(0, size - 1)
+        rollout = model.rollout(
+            data["video"][clips][:, :given], num_frames=given + horizon
         )
-        cls_probe = Ridge(flat(levels[level]), onehot.reshape(-1, 10))
-        n, t = z.shape[:2]
-        decoded.append(
-            (
-                level,
-                pos_probe(flat(z)).reshape(n, t, 2),
-                cls_probe(flat(z)).reshape(n, t, 10).argmax(-1),
-            )
-        )
-    return TITLES[args.model], given, decoded
+    z = rollout.embeddings[0]
+    occupied = probe(flat(z)).reshape(*z.shape[:2], *data["owner"].shape[-2:])
+    # Cells under the band are never scored or trained on; don't draw them.
+    occupied &= data["owner"][0, 0] != IGNORE
+    return TITLES[args.model], given, occupied
 
 
-def render_row(title, given, decoded, data, clips, frame, font, small):
-    video, label = data["video"], data["label"]
-    size = video.shape[-1]
-    panel = size * SCALE
-    width = len(clips) * panel + (len(clips) + 1) * GAP
+def render_row(title, given, occupied, video, frame, font):
+    n, size = occupied.shape[0], video.shape[-1]
+    panel, cell = size * SCALE, PATCH * SCALE
+    width = n * panel + (n + 1) * GAP
     img = Image.new("RGB", (width, HEAD + panel + FOOT), SURFACE)
     d = ImageDraw.Draw(img)
     ahead = frame - given + 1
     status = "given" if ahead <= 0 else f"rollout, {ahead:2d} frame(s) ahead"
     d.text((GAP, 7), f"{title}   frame {frame}   {status}", fill=TEXT, font=font)
-    for i, clip in enumerate(clips):
+    for i in range(n):
         x0 = GAP + i * (panel + GAP)
-        pixels = ((video[clip, frame, 0].numpy() + 1) / 2 * 255).astype(np.uint8)
+        pixels = ((video[i, frame, 0].numpy() + 1) / 2 * 255).astype(np.uint8)
         tile = Image.fromarray(pixels, "L").resize((panel, panel), Image.NEAREST)
         img.paste(tile.convert("RGB"), (x0, HEAD))
         if ahead <= 0:
             continue
-        for level, pos, cls in decoded:
-            r, c = pos[i, frame].tolist()
-            x, y = x0 + (c + 0.5) * SCALE, HEAD + (r + 0.5) * SCALE
-            if level == 0:
-                d.line([x - 8, y - 8, x + 8, y + 8], fill=FINE, width=3)
-                d.line([x - 8, y + 8, x + 8, y - 8], fill=FINE, width=3)
-                guess = int(cls[i, frame])
-                mark = "ok" if guess == int(label[clip]) else "wrong"
-                d.text(
-                    (x0 + 4, HEAD + 4), f"class {guess} ({mark})", fill=FINE, font=small
-                )
-            else:
-                d.ellipse([x - 9, y - 9, x + 9, y + 9], outline=COARSE, width=3)
+        for r, c in occupied[i, frame].nonzero().tolist():
+            x, y = x0 + c * cell, HEAD + r * cell
+            d.rectangle(
+                [x + 1, y + 1, x + cell - 2, y + cell - 2], outline=PRED, width=2
+            )
     return img
 
 
@@ -111,32 +92,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("runs", nargs="+", type=Path)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--clips", type=int, nargs="+", default=[512, 515, 530, 541])
+    parser.add_argument("--clips", type=int, nargs="+", default=[0, 1, 2, 3])
     parser.add_argument("--fit-clips", type=int, default=256)
     parser.add_argument("--show-given", type=int, default=10)
-    parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--threads", type=int, default=None)
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
 
-    first = json.loads((args.runs[0] / "results.json").read_text())["args"]
-    given = given_frames(argparse.Namespace(**first))
-    data = MovingMNIST(get_data_dir("mnist"), train=False).sample(
-        first["eval_clips"], given + args.horizon, torch.Generator().manual_seed(1234)
+    first = argparse.Namespace(
+        **json.loads((args.runs[0] / "results.json").read_text())["args"]
     )
-    rows = [
-        decode_run(r, data, args.clips, args.fit_clips, args.horizon) for r in args.runs
-    ]
+    data = eval_clips(get_data_dir("mnist"), given_frames(first), first)
+    clips = [first.fit_clips + c for c in args.clips]
+    horizon = first.horizon
+    rows = [decode_run(r, data, clips, args.fit_clips, horizon) for r in args.runs]
+    video = data["video"][clips]
     font = ImageFont.load_default(size=15)
-    small = ImageFont.load_default(size=13)
+    given = rows[0][1]
     with tempfile.TemporaryDirectory() as tmp:
         k = 0
-        for frame in range(given - args.show_given, given + args.horizon):
-            row_imgs = [
-                render_row(t, g, d, data, args.clips, frame, font, small)
-                for t, g, d in rows
-            ]
+        for frame in range(given - args.show_given, given + horizon):
+            row_imgs = [render_row(t, g, o, video, frame, font) for t, g, o in rows]
             width = max(im.width for im in row_imgs)
             height = sum(im.height for im in row_imgs)
             canvas = Image.new("RGB", (width + width % 2, height + height % 2), SURFACE)
@@ -145,7 +122,7 @@ def main():
                 canvas.paste(im, (0, y))
                 y += im.height
             repeats = 3 if frame < given else 7
-            if frame == given + args.horizon - 1:
+            if frame == given + horizon - 1:
                 repeats += 50
             for _ in range(repeats):
                 canvas.save(f"{tmp}/{k:05d}.png")
