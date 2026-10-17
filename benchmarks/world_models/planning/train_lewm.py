@@ -102,6 +102,31 @@ def train(model, data, args, ckpt_path: Path) -> dict:
 
 
 @torch.no_grad()
+def recalibrate_batchnorm(model, data, args, batches: int = 100):
+    """Re-estimate BatchNorm running statistics with the final weights.
+
+    The projectors' BatchNorm running averages lag behind the weights while
+    the learning rate is high, so they are recomputed as a plain average over
+    ``batches`` training batches drawn the way training draws them.
+    """
+    g = torch.Generator().manual_seed(args.seed + 1)
+    norms = [m for m in model.modules() if isinstance(m, torch.nn.BatchNorm1d)]
+    for m in norms:
+        m.reset_running_stats()
+        m.momentum = None
+    model.train()
+    for _ in range(batches):
+        video, actions = sample_clips(
+            data, args.batch, model.history + 1, g, args.clips_per_episode
+        )
+        z, _ = model.encode(video)
+        model.predict(z[:, :-1], actions)
+    for m in norms:
+        m.momentum = 0.1
+    model.eval()
+
+
+@torch.no_grad()
 def validate(model, data, n: int = 1024) -> dict:
     """Teacher-forced prediction loss on held-out clips, and a copy-last baseline."""
     model.eval()
@@ -155,6 +180,7 @@ def main():
         flush=True,
     )
     state = train(model, data, args, args.out / "ckpt.pt")
+    recalibrate_batchnorm(model, data, args)
     torch.save(model.state_dict(), args.out / "model.pt")
     result = {"args": {k: str(v) for k, v in vars(args).items()}, "train": state}
     if args.test_data:
