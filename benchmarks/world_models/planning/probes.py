@@ -198,6 +198,11 @@ def main():
     parser.add_argument("--test-frames", type=int, default=4, help="Per episode.")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument(
+        "--skip-references",
+        action="store_true",
+        help="Only probe the trained model (the references do not depend on it).",
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     if args.threads:
@@ -212,7 +217,10 @@ def main():
     untrained = LeWM()
 
     rows = {}
-    for tag, model in (("trained", trained), ("untrained", untrained)):
+    models = [("trained", trained)]
+    if not args.skip_references:
+        models.append(("untrained", untrained))
+    for tag, model in models:
         f_train = features(model, train["frames"])
         f_test = features(model, test["frames"])
         for name in ("global", "cls", "patches"):
@@ -221,10 +229,11 @@ def main():
                 name, f_train[name], f_test[name], train, test, args.epochs
             )
             print(key, rows[key], flush=True)
-    rows["pixels"] = fit_and_score(
-        "pixels", train["frames"], test["frames"], train, test, args.epochs
-    )
-    print("pixels", rows["pixels"], flush=True)
+    if not args.skip_references:
+        rows["pixels"] = fit_and_score(
+            "pixels", train["frames"], test["frames"], train, test, args.epochs
+        )
+        print("pixels", rows["pixels"], flush=True)
     if args.out:
         args.out.write_text(json.dumps(rows, indent=1))
 
