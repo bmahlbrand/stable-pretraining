@@ -36,11 +36,42 @@ def contact(agent: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
     return (moved - commanded).norm(dim=-1) > 4.0
 
 
+def load_dynamics(run: Path) -> SpatialDynamics:
+    """A trained ``spatial.py`` model from its run directory."""
+    run_args = json.loads((run / "train.json").read_text())["args"]
+    level = run_args.get("level", "patches")
+    model = SpatialDynamics(
+        token_dim=128 if level == "patches" else 64,
+        grid=8 if level == "patches" else 1,
+        history=int(run_args["history"]),
+    )
+    model.load_state_dict(torch.load(run / "model.pt"))
+    return model.eval()
+
+
+def dynamics_rollout(model: SpatialDynamics, tokens, actions) -> torch.Tensor:
+    """Roll ``model`` out from frozen ``tokens`` with the recorded ``actions``."""
+    h = model.history
+    pred = model.rollout(
+        model.normalize(tokens[:, CONTEXT - h : CONTEXT]),
+        actions[:, CONTEXT - 1 :],
+        actions[:, CONTEXT - h : CONTEXT - 1],
+    )
+    return pred * model.std + model.mean
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--lewm", type=Path, required=True)
     parser.add_argument("--spatial", type=Path, required=True, help="Run directory.")
+    parser.add_argument(
+        "--global-dynamics",
+        type=Path,
+        default=None,
+        help="Run directory of spatial.py --level global (the same rollout "
+        "training on the global state).",
+    )
     parser.add_argument("--train-data", type=Path, required=True)
     parser.add_argument("--test-data", type=Path, required=True)
     parser.add_argument("--horizon", type=int, default=8)
@@ -53,9 +84,10 @@ def main():
 
     lewm = LeWM().eval()
     lewm.load_state_dict(torch.load(args.lewm))
-    spatial_args = json.loads((args.spatial / "train.json").read_text())["args"]
-    spatial = SpatialDynamics(history=int(spatial_args["history"])).eval()
-    spatial.load_state_dict(torch.load(args.spatial / "model.pt"))
+    spatial = load_dynamics(args.spatial)
+    global_dynamics = (
+        load_dynamics(args.global_dynamics) if args.global_dynamics else None
+    )
 
     g = torch.Generator().manual_seed(0)
     train = frame_targets(torch.load(args.train_data), 6, g)
@@ -78,31 +110,23 @@ def main():
 
     z, _ = lewm.encode(video)
     tokens = encode_patches(lewm, video)
-    hs = spatial.history
-    predicted = {
-        "global": lewm.rollout(
-            z[:, :CONTEXT], actions[:, CONTEXT - 1 :], actions[:, : CONTEXT - 1]
-        ),
-        "patches": spatial.rollout(
-            spatial.normalize(tokens[:, CONTEXT - hs : CONTEXT]),
-            actions[:, CONTEXT - 1 :],
-            actions[:, CONTEXT - hs : CONTEXT - 1],
-        )
-        * spatial.std
-        + spatial.mean,
-    }
     sources = {
         "global": {
-            "rollout": predicted["global"],
+            "rollout": lewm.rollout(
+                z[:, :CONTEXT], actions[:, CONTEXT - 1 :], actions[:, : CONTEXT - 1]
+            ),
             "copy_last": z[:, CONTEXT - 1 : CONTEXT].expand(-1, k, -1),
             "true_frames": z[:, CONTEXT:],
         },
         "patches": {
-            "rollout": predicted["patches"],
+            "rollout": dynamics_rollout(spatial, tokens, actions),
             "copy_last": tokens[:, CONTEXT - 1 : CONTEXT].float().expand(-1, k, -1, -1),
             "true_frames": tokens[:, CONTEXT:].float(),
         },
     }
+    if global_dynamics is not None:
+        rollout = dynamics_rollout(global_dynamics, z[:, :, None], actions)
+        sources["global"]["recursive_rollout"] = rollout[:, :, 0]
     results = {}
     for level, by_source in sources.items():
         for source, x in by_source.items():
