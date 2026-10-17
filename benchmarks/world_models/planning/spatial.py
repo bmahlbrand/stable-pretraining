@@ -12,6 +12,10 @@ horizon instead of only one step ahead.
 Patch tokens are precomputed once for the whole dataset and standardized per
 channel, so the loss weighs channels equally.
 
+``--level global`` trains the same model, with the same rollout training, on
+the frozen global state as a single token instead: the ablation that separates
+the representation from the training scheme.
+
 Example::
 
     python benchmarks/world_models/planning/spatial.py --lewm runs/lewm/model.pt \\
@@ -33,13 +37,21 @@ from world_model import LeWM, _CausalAdaLNBlock, to_float
 
 
 @torch.no_grad()
-def encode_patches(model: LeWM, video: torch.Tensor, batch: int = 512) -> torch.Tensor:
-    """Patch tokens ``[N, T, G*G, D]`` (float16) of uint8 ``video`` ``[N, T, 3, H, W]``."""
+def encode_patches(
+    model: LeWM, video: torch.Tensor, batch: int = 512, level: str = "patches"
+) -> torch.Tensor:
+    """Frozen tokens ``[N, T, n, D]`` (float16) of uint8 ``video`` ``[N, T, 3, H, W]``.
+
+    ``level="patches"``: the ``G*G`` patch tokens. ``level="global"``: the
+    global state as one token.
+    """
     model.eval()
     flat = video.flatten(0, 1)
     out = []
     for i in range(0, len(flat), batch):
-        out.append(model.encoder(to_float(flat[i : i + batch]))[1].half())
+        cls, patches = model.encoder(to_float(flat[i : i + batch]))
+        x = patches if level == "patches" else model.projector(cls)[:, None]
+        out.append(x.half())
     out = torch.cat(out)
     return out.reshape(*video.shape[:2], *out.shape[1:])
 
@@ -239,6 +251,7 @@ def main():
     parser.add_argument("--steps", type=int, default=4000)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--level", choices=("patches", "global"), default="patches")
     parser.add_argument("--history", type=int, default=1)
     parser.add_argument("--rollout", type=int, default=4)
     parser.add_argument("--threads", type=int, default=None)
@@ -257,17 +270,21 @@ def main():
         data = torch.load(path)
         if not cached.exists():
             t0 = time.time()
-            torch.save(encode_patches(lewm, data["video"]), cached)
+            torch.save(encode_patches(lewm, data["video"], level=args.level), cached)
             print(f"encoded {split} in {time.time() - t0:.0f}s", flush=True)
         cache[split] = (torch.load(cached), data["action"])
         del data
 
     torch.manual_seed(args.seed)
     tokens, actions = cache["train"]
-    model = SpatialDynamics(token_dim=tokens.shape[-1], history=args.history)
+    model = SpatialDynamics(
+        token_dim=tokens.shape[-1],
+        grid=8 if args.level == "patches" else 1,
+        history=args.history,
+    )
     model.fit_scale(tokens[:, ::4])
     print(
-        f"spatial dynamics: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M "
+        f"{args.level} dynamics: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M "
         f"params, history {args.history}, rollout {args.rollout}",
         flush=True,
     )
