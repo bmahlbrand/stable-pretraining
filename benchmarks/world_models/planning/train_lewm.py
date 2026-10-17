@@ -20,10 +20,18 @@ import torch
 from world_model import LeWM
 
 
-def sample_clips(data: dict, n: int, length: int, g: torch.Generator) -> tuple:
-    """Random ``length``-frame windows and the actions between their frames."""
+def sample_clips(
+    data: dict, n: int, length: int, g: torch.Generator, per_episode: int = 1
+) -> tuple:
+    """Random ``length``-frame windows and the actions between their frames.
+
+    With ``per_episode > 1`` the ``n`` windows come from ``n / per_episode``
+    episodes, ``per_episode`` windows each, so every batch holds several agent
+    positions per door layout.
+    """
     episodes, frames = data["video"].shape[:2]
-    idx = torch.randint(episodes, (n,), generator=g)
+    idx = torch.randint(episodes, (n // per_episode,), generator=g)
+    idx = idx.repeat_interleave(per_episode)
     start = torch.randint(frames - length + 1, (n,), generator=g)
     t = start[:, None] + torch.arange(length)
     return data["video"][idx[:, None], t], data["action"][idx[:, None], t[:, :-1]]
@@ -54,7 +62,9 @@ def train(model, data, args, ckpt_path: Path) -> dict:
     running = {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
     t0 = time.time() - state["seconds"]
     for step in range(state["step"] + 1, args.steps + 1):
-        video, actions = sample_clips(data, args.batch, model.history + 1, g)
+        video, actions = sample_clips(
+            data, args.batch, model.history + 1, g, args.clips_per_episode
+        )
         out = model(video, actions)
         opt.zero_grad(set_to_none=True)
         out.loss.backward()
@@ -119,6 +129,13 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lamb", type=float, default=0.09)
     parser.add_argument("--history", type=int, default=3)
+    parser.add_argument(
+        "--clips-per-episode",
+        type=int,
+        default=1,
+        help="Windows per episode in a batch; SIGReg then sees several agent "
+        "positions per door layout.",
+    )
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--ckpt-every", type=int, default=250)
