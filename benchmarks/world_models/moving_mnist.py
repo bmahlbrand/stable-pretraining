@@ -1,8 +1,11 @@
 """Moving MNIST generated on the fly, with an optional occluder and ground truth.
 
 Downscaled MNIST digits bounce off the frame's walls at constant speed. An
-optional vertical band of constant gray hides whatever passes behind it, so a
-digit can vanish for many frames and re-emerge later. Every clip comes with a
+optional vertical band hides whatever passes behind it, so a digit can vanish
+for many frames and re-emerge later. With ``textured=True`` frames are RGB:
+each clip has its own colored noise texture as background, which the camera
+pans across slowly, colored digits, and a textured band, so the scene has real
+content besides the digits. Every clip comes with a
 per-cell map of which digit (if any) is visible there, which probes use to
 check what an embedding encodes and to score latent rollouts, plus each
 digit's visible fraction per frame for finding re-emergence events.
@@ -20,6 +23,24 @@ BACKGROUND = -1
 IGNORE = -2
 
 
+def fractal_noise(
+    n: int, size: int, generator: torch.Generator, octaves: int = 5, base: int = 4
+) -> torch.Tensor:
+    """Smooth multi-octave noise textures ``[n, 1, size, size]`` in ``[0, 1]``."""
+    out = torch.zeros(n, 1, size, size)
+    amplitude, total = 1.0, 0.0
+    for octave in range(octaves):
+        grid = torch.randn(
+            n, 1, base * 2**octave, base * 2**octave, generator=generator
+        )
+        out += amplitude * F.interpolate(grid, size=size, mode="bicubic")
+        total += amplitude
+        amplitude *= 0.65
+    lo = out.amin((-1, -2), keepdim=True)
+    hi = out.amax((-1, -2), keepdim=True)
+    return (out - lo) / (hi - lo + 1e-6)
+
+
 class MovingMNIST:
     """Generator of bouncing-digit clips.
 
@@ -34,6 +55,9 @@ class MovingMNIST:
         occluder_value: Band intensity in ``[0, 1]``.
         cell: Label-map cell size in pixels (the finest token's patch size).
         speed: Range of per-frame speeds in pixels.
+        textured: RGB frames with textured backgrounds, colored digits and a
+            textured band instead of grayscale digits on black.
+        pan_speed: Range of per-frame background pan speeds in pixels.
     """
 
     def __init__(
@@ -47,6 +71,8 @@ class MovingMNIST:
         occluder_value: float = 0.5,
         cell: int = 8,
         speed: tuple = (0.8, 2.0),
+        textured: bool = False,
+        pan_speed: tuple = (0.25, 0.6),
     ):
         mnist = torchvision.datasets.MNIST(root=str(root), train=train, download=True)
         digits = mnist.data.float().div(255).unsqueeze(1)
@@ -63,6 +89,9 @@ class MovingMNIST:
             self.band[:, occluder[0] : occluder[1]] = True
         cells = F.avg_pool2d(self.band[None, None].float(), cell)[0, 0]
         self.ignore_cells = cells > 0.5
+        self.textured = textured
+        self.pan_speed = pan_speed
+        self.channels = 3 if textured else 1
 
     def sample(
         self, n: int, num_frames: int, generator: torch.Generator, maps: bool = True
@@ -77,7 +106,7 @@ class MovingMNIST:
                 ``video``).
 
         Returns:
-            Dict with ``video`` ``[n, T, 1, size, size]`` in ``[-1, 1]``;
+            Dict with ``video`` ``[n, T, C, size, size]`` in ``[-1, 1]``;
             ``position`` ``[n, T, D, 2]`` digit centers (row, col) in pixels;
             ``label`` ``[n, D]`` digit classes; ``visible`` ``[n, T, D]`` the
             fraction of each digit's ink not hidden by the band; and
@@ -85,7 +114,7 @@ class MovingMNIST:
             digit with most visible ink in each cell, ``BACKGROUND`` for empty
             cells and ``IGNORE`` for cells under the band.
         """
-        chunk = 128  # rendering memory grows with clips x frames x digits
+        chunk = 64  # rendering memory grows with clips x frames x digits
         if n > chunk:
             parts = [
                 self.sample(min(chunk, n - i), num_frames, generator, maps)
@@ -113,10 +142,13 @@ class MovingMNIST:
         per_digit = corners.transpose(1, 2).reshape(n * d, num_frames, 2)
         ink = self._render(self.digits[idx.flatten()], per_digit)
         ink = ink.reshape(n, d, num_frames, self.size, self.size).transpose(1, 2)
-        frames = ink.max(dim=2).values
-        frames = torch.where(self.band, self.occluder_value, frames)
+        if self.textured:
+            frames = self._compose_textured(ink, generator)
+        else:
+            frames = ink.max(dim=2).values
+            frames = torch.where(self.band, self.occluder_value, frames).unsqueeze(2)
         clips = {
-            "video": (frames * 2 - 1).unsqueeze(2),
+            "video": frames * 2 - 1,
             "position": corners + (self.digit_size - 1) / 2,
             "label": self.labels[idx],
         }
@@ -157,6 +189,63 @@ class MovingMNIST:
             kept.append(clips)
             count += int(keep.sum())
         return {k: torch.cat([c[k] for c in kept])[:n] for k in kept[0]}
+
+    def _compose_textured(self, ink: torch.Tensor, generator: torch.Generator):
+        """RGB frames ``[n, T, 3, H, W]`` in ``[0, 1]`` from digit ink ``[n, T, D, H, W]``."""
+        n, t, d, size = *ink.shape[:3], self.size
+        span = size + 64
+        # Two-tone colored texture with contrast in every channel.
+        tone = torch.stack(
+            [
+                0.3 * torch.rand(n, 3, generator=generator),
+                0.3 + 0.3 * torch.rand(n, 3, generator=generator),
+            ],
+            -1,
+        )
+        swap = torch.rand(n, 3, 1, generator=generator) < 0.5
+        tone = torch.where(swap, tone.flip(-1), tone)
+        noise = fractal_noise(n, span, generator)
+        tex = tone[..., :1, None] + (tone[..., 1:, None] - tone[..., :1, None]) * noise
+        # The camera pans across the texture at constant velocity, staying inside.
+        heading = 2 * math.pi * torch.rand(n, generator=generator)
+        lo, hi = self.pan_speed
+        speed = lo + (hi - lo) * torch.rand(n, generator=generator)
+        vel = torch.stack([heading.sin(), heading.cos()], -1) * speed[:, None]
+        room = span - size - 1 - vel.abs() * (t - 1)
+        start = torch.where(vel < 0, vel.abs() * (t - 1), 0) + room * torch.rand(
+            n, 2, generator=generator
+        )
+        frames = self._crop(
+            tex, start[:, None] + vel[:, None] * torch.arange(t)[:, None]
+        )
+        # Digits are opaque where their ink is; overlapping ink mixes colors.
+        colors = 0.65 + 0.35 * torch.rand(n, d, 3, generator=generator)
+        weight = ink.sum(2, keepdim=True)
+        color = torch.einsum("ntdhw,ndc->ntchw", ink, colors) / weight.clamp_min(1e-6)
+        frames = frames + weight.clamp(max=1) * (color - frames)
+        wall = 0.35 + 0.3 * fractal_noise(n, size, generator)
+        return torch.where(self.band, wall[:, None], frames)
+
+    def _crop(self, tex: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """Bilinear frame-sized crops ``[n, T, C, s, s]`` of ``tex`` ``[n, C, S, S]``.
+
+        ``offsets`` ``[n, T, 2]`` are each crop's top-left (row, col) in pixels.
+        """
+        n, t = offsets.shape[:2]
+        s, span = self.size, tex.shape[-1]
+        pixels = torch.arange(s, dtype=torch.float32)
+        rows = offsets[..., 0, None] + pixels  # [n, T, s]
+        cols = offsets[..., 1, None] + pixels
+        grid = torch.stack(
+            [
+                cols[:, :, None, :].expand(-1, -1, s, -1),
+                rows[:, :, :, None].expand(-1, -1, -1, s),
+            ],
+            -1,
+        )
+        grid = grid * 2 / (span - 1) - 1
+        out = F.grid_sample(tex, grid.reshape(n, t * s, s, 2), align_corners=True)
+        return out.reshape(n, -1, t, s, s).transpose(1, 2)
 
     def _render(self, digits: torch.Tensor, corners: torch.Tensor) -> torch.Tensor:
         """Place ``digits`` ``[N, 1, s, s]`` at ``corners`` ``[N, T, 2]``.
