@@ -185,6 +185,11 @@ def main():
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--ckpt-every", type=int, default=250)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Re-score a finished run from <out>/model.pt; keeps its training log.",
+    )
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -200,8 +205,12 @@ def main():
         f"{clip_frames(model)}-frame training clips, device {device}",
         flush=True,
     )
-    train_data = MovingMNIST(root, train=True, cell=PATCH, **DATA)
-    state = train(model, train_data, args, device, out / "ckpt.pt")
+    if args.eval_only:
+        model.load_state_dict(torch.load(out / "model.pt", map_location=device))
+        state = json.loads((out / "results.json").read_text())["train"]
+    else:
+        train_data = MovingMNIST(root, train=True, cell=PATCH, **DATA)
+        state = train(model, train_data, args, device, out / "ckpt.pt")
 
     given = given_frames(args)
     data = eval_clips(root, given, args)

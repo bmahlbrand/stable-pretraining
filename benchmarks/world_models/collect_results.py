@@ -44,11 +44,12 @@ def fmt(values) -> str:
 
 
 def curves(runs, level, metric, source="rollout"):
-    """Per-seed curves ``[seeds, horizon]``."""
-    if source == "rollout":
-        return np.array(
-            [r["eval"]["rollout"][level][metric] for r in runs], dtype=float
-        )
+    """Per-seed curves ``[seeds, horizon]``.
+
+    ``source`` is ``"rollout"``, ``"rollout_mismatched"`` or a reference name.
+    """
+    if source.startswith("rollout"):
+        return np.array([r["eval"][source][level][metric] for r in runs], dtype=float)
     return np.array([r["eval"]["reference"][source][metric] for r in runs], dtype=float)
 
 
@@ -81,6 +82,35 @@ def table(runs: dict) -> str:
                     + f" | {fmt(np.nanmean(c, 1))} |"
                 )
         lines.append("")
+
+    lines += [
+        "### Memory: recall on re-emerging digits, mean over horizons 1-32",
+        "",
+        "Scored against the clip's own truth and against another clip's truth;",
+        "the difference is what the model remembers about this clip's hidden",
+        "digit rather than a generic guess near the occluder.",
+        "",
+        "| Model | Level | Own clip | Other clip | Clip-specific |",
+        "|---|---|---|---|---|",
+    ]
+    for model in LABELS:
+        rs = [r for r in runs.get(model, []) if "rollout_mismatched" in r["eval"]]
+        for level in range(num_levels(rs)):
+            own = np.nanmean(curves(rs, level, "reemerged_recall"), 1)
+            other = np.nanmean(
+                curves(rs, level, "reemerged_recall", "rollout_mismatched"), 1
+            )
+            lines.append(
+                f"| {LABELS[model]} | {level} | {fmt(own)} | {fmt(other)} | "
+                f"{fmt(own - other)} |"
+            )
+    any_run = next(iter(runs.values()))[0]["eval"]["reference"]
+    if "beside_occluder" in any_run:
+        guess = np.nanmean(any_run["beside_occluder"]["reemerged_recall"])
+        lines.append(
+            f"| Fixed guess: cells beside the occluder | - | {guess:.3f} | - | - |"
+        )
+    lines.append("")
 
     lines += [
         "### Probes on the true future frames, per level (finest first)",

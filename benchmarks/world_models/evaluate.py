@@ -14,8 +14,13 @@ same way:
   the probes decode its predicted embeddings. Every test clip has a digit that
   is hidden behind the occluder at the last given frame and re-emerges during
   the rollout, so finding that digit tests memory.
-- References: the probe on the true future frames (read-out ceiling) and
-  copying the last given frame.
+- References: the probe on the true future frames (read-out ceiling),
+  copying the last given frame, and a fixed guess that marks every cell
+  beside the occluder (where re-emerging digits must appear).
+- Control: each model's predictions are also scored against another clip's
+  truth. The drop in re-emerging recall is the part that is specific to the
+  clip, i.e. memory of the particular hidden digit rather than a generic
+  guess near the occluder.
 
 Scores per horizon, pooled over clips and over cells not under the occluder:
 ``iou`` of predicted and true occupied cells, ``recall`` of occupied cells,
@@ -138,16 +143,29 @@ def evaluate(model, data: dict, given: int, horizon: int, num_fit: int) -> dict:
 
     with torch.no_grad():
         rollout = model.rollout(video[test][:, :given], num_frames=given + horizon)
-    res["rollout"] = [
-        score(probes[level](_flat(z[:, given : given + horizon])))
+    preds = [
+        probes[level](_flat(z[:, given : given + horizon])).reshape(n_test, horizon, -1)
         for level, z in enumerate(rollout.embeddings)
+    ]
+    res["rollout"] = [score(p) for p in preds]
+    # Control: the same predictions scored against the next clip's truth. A
+    # model that remembers this clip's hidden digit loses recall here; a
+    # generic guess (e.g. "digits next to the band") does not.
+    res["rollout_mismatched"] = [
+        _scores(p, future.roll(1, 0), reemerging.roll(1, 0)) for p in preds
     ]
 
     z0 = levels[0][test]
     last = probes[0](_flat(z0[:, given - 1 : given])).reshape(n_test, 1, -1)
+    ignored = owner[0, 0].reshape(data["owner"].shape[-2:]) == IGNORE
+    beside = torch.zeros_like(ignored)
+    beside[:, 1:] |= ignored[:, :-1]
+    beside[:, :-1] |= ignored[:, 1:]
+    beside &= ~ignored
     res["reference"] = {
         "probe_on_true_future": score(probes[0](_flat(z0[:, given : given + horizon]))),
         "copy_last_frame": score(last.expand(-1, horizon, -1)),
+        "beside_occluder": score(beside.flatten().expand(n_test, horizon, -1)),
     }
     return res
 
@@ -169,6 +187,8 @@ def summarize(res: dict, horizons=(1, 2, 4, 8, 16, 32)) -> str:
         out.append(f"{metric} at horizons {hs} | mean")
         for level, scores in enumerate(res["rollout"]):
             out.append(row(f"rollout level {level}", scores[metric]))
+        for level, scores in enumerate(res.get("rollout_mismatched", [])):
+            out.append(row(f"  vs other clip, level {level}", scores[metric]))
         for name, scores in res["reference"].items():
             out.append(row(name, scores[metric]))
     return "\n".join(out)
