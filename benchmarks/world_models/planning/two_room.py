@@ -94,6 +94,82 @@ def layout(env: TwoRoomEnv) -> dict:
     return {"num_doors": env.num_doors, "door_position": position, "door_size": size}
 
 
+class SimDynamics:
+    """Batched copy of ``TwoRoomEnv``'s movement and collisions (vertical wall).
+
+    Lets a planner score action candidates with the true dynamics, as an
+    upper reference for what a world model's rollouts could achieve.
+    """
+
+    def __init__(self, env: TwoRoomEnv):
+        assert env.wall_axis == 1, "only the default vertical wall is supported"
+        self.speed = float(env.variation_space["agent"]["speed"].value.item())
+        radius = float(env.variation_space["agent"]["radius"].value.item())
+        half = env.wall_thickness // 2
+        self.left = WALL - half - radius
+        self.right = WALL + half + radius
+        self.lo = env.BORDER_SIZE + radius
+        self.hi = ENV_SIZE - env.BORDER_SIZE - radius
+        self.doors = [
+            (float(c), float(s)) for c, s in zip(env.door_positions, env.door_sizes)
+        ]
+
+    def step(self, position: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Next (x, y) ``[N, 2]`` after one environment action ``[N, 2]``."""
+        nxt = (position + action.clamp(-1, 1) * self.speed).clamp(self.lo, self.hi)
+        x, y = nxt.unbind(-1)
+        door = torch.zeros_like(y, dtype=torch.bool)
+        for c, s in self.doors:
+            door |= (y >= c - s - 1.75) & (y <= c + s + 1.75)
+        left = position[:, 0] < WALL
+        x = torch.where(left & (x > self.left) & ~door, self.left - 0.5, x)
+        x = torch.where(~left & (x < self.right) & ~door, self.right + 0.5, x)
+        return torch.stack([x, y], -1)
+
+    def rollout(self, position: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Positions ``[N, K, 2]`` after each model step of ``actions`` ``[N, K, ACTION_DIM]``."""
+        out = []
+        for k in range(actions.shape[1]):
+            for a in actions[:, k].reshape(len(actions), FRAMESKIP, 2).unbind(1):
+                position = self.step(position, a)
+            out.append(position)
+        return torch.stack(out, 1)
+
+
+def reset_near_door(env: TwoRoomEnv, seed: int, offset: int) -> int:
+    """Start ``offset`` environment steps before the goal on a path through a door.
+
+    Runs the noise-free expert from a random layout, then starts the agent
+    where the expert was 5 to ``offset - 5`` steps before crossing the wall,
+    with the goal where the expert was ``offset`` steps later. The goal is
+    reachable within ``offset`` steps but only through the door, which is the
+    test from the world model's point of view. Returns the accepted seed.
+    """
+    while True:
+        seed = reset(env, seed)
+        expert = ExpertPolicy(seed=seed)
+        expert.set_env(env)
+        path = [env.agent_position.clone()]
+        for _ in range(150):
+            info = {
+                "state": env.agent_position.numpy(),
+                "goal_state": env.target_position.numpy(),
+            }
+            env.step(expert.get_action(info))
+            path.append(env.agent_position.clone())
+        path = torch.stack(path)
+        side = path[:, 0] < WALL
+        crossed = (side != side[0]).nonzero()
+        rng = np.random.default_rng(seed)
+        if len(crossed):
+            start = int(crossed[0]) - int(rng.integers(5, offset - 4))
+            if start >= 0 and start + offset < len(path):
+                env._set_state(path[start].tolist())
+                env._set_goal_state(path[start + offset].tolist())
+                return seed
+        seed += 1_000_003
+
+
 class RandomWalk:
     """Persistent random actions: wanders, hits walls, sometimes finds doors."""
 
