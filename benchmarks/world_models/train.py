@@ -1,7 +1,8 @@
 """Train and evaluate a world model on occluded four-digit Moving MNIST.
 
-Four MNIST digits bounce in a 64x64 frame with an opaque vertical band they
-can hide behind for many frames. The task needs both memory (a hidden digit's
+Four colored MNIST digits bounce in a 64x64 RGB frame over a textured
+background that the camera pans across, with an opaque textured band they can
+hide behind for many frames. The task needs both memory (a hidden digit's
 identity and motion) and more detail than one vector per frame easily holds,
 which is where a hierarchy of token levels should help.
 
@@ -41,7 +42,14 @@ from utils import get_data_dir  # noqa: E402
 
 MODELS = ("hlewm", "hlewm-fullres", "lewm")
 SIZE, PATCH = 64, 8
-DATA = {"size": SIZE, "digit_size": 16, "num_digits": 4, "occluder": (20, 44)}
+DATA = {
+    "size": SIZE,
+    "digit_size": 16,
+    "num_digits": 4,
+    "occluder": (20, 44),
+    "textured": True,
+}
+CHANNELS = 3 if DATA["textured"] else 1
 TOKENS_PER_LEVEL = (64, 16, 4)
 NUM_FRAMES_PER_LEVEL = (1, 4, 16)
 WIDTHS = {
@@ -62,12 +70,14 @@ def build(args):
     torch.manual_seed(args.seed)
     if args.model == "lewm":
         widths = {**WIDTHS, "embed_dim": args.lewm_embed_dim}
-        return LeWM(SIZE, PATCH, 1, history=args.history, lamb=args.lamb, **widths)
+        return LeWM(
+            SIZE, PATCH, CHANNELS, history=args.history, lamb=args.lamb, **widths
+        )
     return HLeWM(
         image_size=SIZE,
         patch_size=PATCH,
         num_levels=3,
-        in_channels=1,
+        in_channels=CHANNELS,
         predictor_dim_head=WIDTHS["predictor_dim"] // WIDTHS["predictor_heads"],
         predictor_dropout=0.0,
         schedule="millivid" if args.model == "hlewm" else "full_resolution",
