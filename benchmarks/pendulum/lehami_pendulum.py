@@ -1,9 +1,15 @@
 """LeHami on a pixel pendulum: latent volume and long-horizon velocity.
 
 A small CPU-scale check of the two headline claims of LeHami (Yalovetzky,
-Balestriero & LeCun, 2026) on the setting of the paper's conservative
-multi-rod pendulum: 64x64 frames of a frictionless pendulum with one of three
-rod lengths, drawn to scale, sampled at 20 Hz.
+Balestriero & LeCun, 2026) on the paper's two pendulum settings, rendered as
+64x64 frames with the rod drawn to scale:
+
+- ``--task conservative``: a frictionless pendulum with one of three rod
+  lengths, sampled at 20 Hz.
+- ``--task actuated``: the swing-up setting. Three rod lengths times three bob
+  masses (bob size shows the mass), driven by a random torque held for three
+  frames, ``theta'' = -(g / L) sin(theta) + u / (m L^2)``, sampled at 10 Hz.
+  Every model is conditioned on the torque.
 
 Three models share the encoder, projector, SIGReg and multi-step rollout
 training and differ only in the predictor:
@@ -18,7 +24,8 @@ training and differ only in the predictor:
   latents (64-d, matching LeHami's phase-space size), the paper's baseline.
 
 Evaluation rolls each model out for 60 steps from frame 3 of held-out
-episodes, without seeing any further frame, and reports:
+episodes, without seeing any further frame (but with the recorded torques on
+the actuated task), and reports:
 
 - R^2 of the angular velocity and the angle read from the predicted state by
   probes fit on the model's states of real training frames, with the paper's
@@ -35,6 +42,7 @@ Example::
     python benchmarks/pendulum/lehami_pendulum.py --model lewm --out runs/lewm
     python benchmarks/pendulum/lehami_pendulum.py --model phase-mlp --out runs/phase_mlp
     python benchmarks/pendulum/lehami_pendulum.py --report runs/lehami runs/phase_mlp runs/lewm
+    python benchmarks/pendulum/lehami_pendulum.py --task actuated --model lehami --out runs/act_lehami
 """
 
 import argparse
@@ -60,68 +68,123 @@ from stable_pretraining.methods.lehami import (
 from stable_pretraining.methods.lejepa import SlicedEppsPulley
 
 G = 9.81
-DT = 0.05
 SUBSTEP = 0.0125
 IMG_SIZE = 64
-BOB_R = 4
 PIVOT = (IMG_SIZE // 2, IMG_SIZE // 2)
-MAX_ROD_PX = IMG_SIZE // 2 - BOB_R - 1
 LENGTHS = (0.7, 1.0, 1.4)
 # Dimensionless initial-velocity bound; L = 1 gets U(-2, 2) rad/s as in the paper.
 OMEGA_BOUND = 2.0 / math.sqrt(G)
-EPISODE_FRAMES = 100
 CLIP_FRAMES = 14
 ANCHOR = CAUSAL_WINDOW - 1
 HORIZON = 60
 LATENT_DIM = 32
+TASKS = {
+    "conservative": {
+        "dt": 0.05,
+        "frames": 100,
+        "masses": (1.0,),
+        "u_max": 0.0,
+        "hold": 1,
+        "max_bob_r": 4.0,
+    },
+    "actuated": {
+        "dt": 0.1,
+        "frames": 80,
+        "masses": (0.5, 1.0, 2.0),
+        "u_max": 4.0,
+        "hold": 3,
+        "max_bob_r": 6.0,
+    },
+}
 
 
-def simulate(theta: float, omega: float, length: float) -> np.ndarray:
-    """``(theta, omega)`` per frame ``[EPISODE_FRAMES, 2]``, RK4 at ``SUBSTEP``."""
+def simulate(theta, omega, length, mass, actions, task) -> np.ndarray:
+    """``(theta, omega)`` per frame, RK4 at ``SUBSTEP``.
 
-    def deriv(th, om):
-        return om, -(G / length) * math.sin(th)
+    ``actions[t]`` is the torque over ``[t, t + 1)``; the last one drives nothing.
+    """
 
-    out = np.empty((EPISODE_FRAMES, 2), dtype=np.float32)
-    for t in range(EPISODE_FRAMES):
+    def deriv(th, om, u):
+        return om, -(G / length) * math.sin(th) + u / (mass * length**2)
+
+    frames = task["frames"]
+    out = np.empty((frames, 2), dtype=np.float32)
+    for t in range(frames):
         out[t] = theta, omega
-        for _ in range(round(DT / SUBSTEP)):
-            k1 = deriv(theta, omega)
-            k2 = deriv(theta + SUBSTEP / 2 * k1[0], omega + SUBSTEP / 2 * k1[1])
-            k3 = deriv(theta + SUBSTEP / 2 * k2[0], omega + SUBSTEP / 2 * k2[1])
-            k4 = deriv(theta + SUBSTEP * k3[0], omega + SUBSTEP * k3[1])
+        u = float(actions[t])
+        for _ in range(round(task["dt"] / SUBSTEP)):
+            k1 = deriv(theta, omega, u)
+            k2 = deriv(theta + SUBSTEP / 2 * k1[0], omega + SUBSTEP / 2 * k1[1], u)
+            k3 = deriv(theta + SUBSTEP / 2 * k2[0], omega + SUBSTEP / 2 * k2[1], u)
+            k4 = deriv(theta + SUBSTEP * k3[0], omega + SUBSTEP * k3[1], u)
             theta += SUBSTEP / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])
             omega += SUBSTEP / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
     return out
 
 
-def render(theta: float, rod_px: float) -> np.ndarray:
+def geometry(length: float, mass: float, task: dict) -> tuple[float, float]:
+    """Rod length and bob radius in pixels: rod to scale, bob radius ~ m^(1/3)."""
+    bob_r = min(task["max_bob_r"], 4.0 * mass ** (1 / 3))
+    rod_px = (IMG_SIZE // 2 - task["max_bob_r"] - 1) * length / max(LENGTHS)
+    return rod_px, bob_r
+
+
+def render(theta: float, rod_px: float, bob_r: float) -> np.ndarray:
     img = Image.new("RGB", (IMG_SIZE, IMG_SIZE), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
     x = PIVOT[0] + rod_px * math.sin(theta)
     y = PIVOT[1] + rod_px * math.cos(theta)
     draw.line([PIVOT, (x, y)], fill=(50, 50, 50), width=2)
-    draw.ellipse([x - BOB_R, y - BOB_R, x + BOB_R, y + BOB_R], fill=(200, 50, 50))
+    draw.ellipse([x - bob_r, y - bob_r, x + bob_r, y + bob_r], fill=(200, 50, 50))
     draw.ellipse(
         [PIVOT[0] - 2, PIVOT[1] - 2, PIVOT[0] + 2, PIVOT[1] + 2], fill=(50, 50, 200)
     )
     return np.asarray(img)
 
 
-def make_episodes(per_length: int, seed: int) -> dict:
-    """Episodes ``video`` ``[N, T, 3, 64, 64]`` uint8 and ``state`` ``[N, T, 2]``."""
+def make_episodes(episodes: int, seed: int, task_name: str) -> dict:
+    """Episodes split evenly over the (length, mass) cells of a task.
+
+    Returns:
+        ``video`` ``[N, T, 3, 64, 64]`` uint8, ``state`` ``[N, T, 2]``
+        (angle, angular velocity), ``action`` ``[N, T, 1]`` torques, and
+        ``length`` / ``mass`` per episode.
+    """
+    task = TASKS[task_name]
+    cells = [(L, m) for L in LENGTHS for m in task["masses"]]
+    per_cell = math.ceil(episodes / len(cells))
     rng = np.random.default_rng(seed)
-    videos, states = [], []
-    for length in LENGTHS:
-        rod_px = MAX_ROD_PX * length / max(LENGTHS)
-        for _ in range(per_length):
+    videos, states, actions, params = [], [], [], []
+    for length, mass in cells:
+        rod_px, bob_r = geometry(length, mass, task)
+        for _ in range(per_cell):
             theta = rng.uniform(-math.pi, math.pi)
             omega = rng.uniform(-OMEGA_BOUND, OMEGA_BOUND) * math.sqrt(G / length)
-            state = simulate(theta, omega, length)
-            videos.append(np.stack([render(float(a), rod_px) for a in state[:, 0]]))
+            u = np.zeros(task["frames"], dtype=np.float32)
+            if task["u_max"]:
+                blocks = rng.uniform(
+                    -task["u_max"],
+                    task["u_max"],
+                    math.ceil(task["frames"] / task["hold"]),
+                )
+                u = np.repeat(blocks, task["hold"])[: task["frames"]].astype(np.float32)
+                u[-1] = 0.0
+            state = simulate(theta, omega, length, mass, u, task)
+            videos.append(
+                np.stack([render(float(a), rod_px, bob_r) for a in state[:, 0]])
+            )
             states.append(state)
+            actions.append(u)
+            params.append((length, mass))
     video = torch.from_numpy(np.stack(videos)).permute(0, 1, 4, 2, 3).contiguous()
-    return {"video": video, "state": torch.from_numpy(np.stack(states))}
+    params = torch.tensor(params)
+    return {
+        "video": video,
+        "state": torch.from_numpy(np.stack(states)),
+        "action": torch.from_numpy(np.stack(actions))[..., None],
+        "length": params[:, 0],
+        "mass": params[:, 1],
+    }
 
 
 def to_float(video: torch.Tensor) -> torch.Tensor:
@@ -152,11 +215,11 @@ def conv_encoder(channels=(16, 32, 64), out_dim: int = 128) -> nn.Module:
 class ResidualPhaseFlow(nn.Module):
     """Unconstrained step ``(q, p) -> (q, p) + MLP(q, p)``, same interface as the flow."""
 
-    def __init__(self, latent_dim: int, hidden_dim: int):
+    def __init__(self, latent_dim: int, hidden_dim: int, action_dim: int = 0):
         super().__init__()
         self.latent_dim = latent_dim
         self.net = nn.Sequential(
-            nn.Linear(2 * latent_dim, hidden_dim),
+            nn.Linear(2 * latent_dim + action_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -166,14 +229,17 @@ class ResidualPhaseFlow(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, q, p, u=None):
-        delta = self.net(torch.cat([q, p], dim=-1))
+        x = torch.cat([q, p] if u is None else [q, p, u], dim=-1)
+        delta = self.net(x)
         return q + delta[:, : self.latent_dim], p + delta[:, self.latent_dim :]
 
 
 class LeWMStyle(nn.Module):
     """LeWorldModel-style baseline: causal transformer over three latents."""
 
-    def __init__(self, encoder: nn.Module, encoder_dim: int, embed_dim: int = 64):
+    def __init__(
+        self, encoder: nn.Module, encoder_dim: int, embed_dim: int = 64, action_dim=0
+    ):
         super().__init__()
         self.encoder = encoder
         self.embed_dim = embed_dim
@@ -185,7 +251,8 @@ class LeWMStyle(nn.Module):
             nn.Linear(2048, embed_dim),
         )
         width = 256
-        self.inp = nn.Linear(embed_dim, width)
+        # The action taken at each frame is concatenated to that frame's latent.
+        self.inp = nn.Linear(embed_dim + action_dim, width)
         self.time = nn.Parameter(torch.randn(1, self.history, width) * 0.02)
         layer = nn.TransformerEncoderLayer(
             width, 8, 4 * width, dropout=0.0, batch_first=True, norm_first=True
@@ -204,29 +271,33 @@ class LeWMStyle(nn.Module):
         z = self.projector(self.encoder(video.flatten(0, 1)))
         return z.view(b, t, self.embed_dim)
 
-    def step(self, window):
-        """Next latent from a window ``[B, 3, D]``."""
-        x = self.predictor(self.inp(window) + self.time, mask=self.causal)
+    def step(self, window, actions=None):
+        """Next latent from a window ``[B, 3, D]`` and its actions ``[B, 3, A]``."""
+        x = window if actions is None else torch.cat([window, actions], dim=-1)
+        x = self.predictor(self.inp(x) + self.time, mask=self.causal)
         return self.out(x[:, -1])
 
-    def forward(self, video):
+    def forward(self, video, actions=None):
         z = self.encode(video)
         window = z[:, : self.history]
         losses = []
         for k in range(z.shape[1] - self.history):
-            nxt = self.step(window)
+            acts = None if actions is None else actions[:, k : k + self.history]
+            nxt = self.step(window, acts)
             losses.append(F.mse_loss(nxt, z[:, self.history + k]))
             window = torch.cat([window[:, 1:], nxt[:, None]], 1)
         sigreg = torch.stack([self.sigreg(z[:, i]) for i in range(z.shape[1])]).mean()
         return torch.stack(losses).mean() + 0.25 * sigreg
 
 
-def build(kind: str) -> nn.Module:
+def build(kind: str, task_name: str) -> nn.Module:
     encoder = conv_encoder()
+    action_dim = 1 if TASKS[task_name]["u_max"] else 0
     if kind == "lewm":
-        return LeWMStyle(encoder, 128)
+        return LeWMStyle(encoder, 128, action_dim=action_dim)
     model = LeHami(
         encoder=encoder,
+        action_dim=action_dim,
         latent_dim=LATENT_DIM,
         encoder_dim=128,
         flow_hidden_dim=512,
@@ -234,22 +305,27 @@ def build(kind: str) -> nn.Module:
         sigreg_on="joint",
     )
     if kind == "phase-mlp":
-        model.flow = ResidualPhaseFlow(LATENT_DIM, 512)
+        model.flow = ResidualPhaseFlow(
+            LATENT_DIM, 512, 2 * LATENT_DIM if action_dim else 0
+        )
     return model
 
 
-def loss_of(kind: str, model: nn.Module, clip: torch.Tensor) -> torch.Tensor:
+def loss_of(kind: str, model: nn.Module, clip, actions) -> torch.Tensor:
     if kind == "lewm":
         # history 3 + 8 rollout steps, as in the paper's baseline
-        return model(clip[:, :11])
-    return model(clip).loss
+        return model(clip[:, :11], None if actions is None else actions[:, :10])
+    return model(clip, actions).loss
 
 
 def sample_clips(data, n, g):
-    idx = torch.randint(len(data["video"]), (n,), generator=g)
-    start = torch.randint(EPISODE_FRAMES - CLIP_FRAMES + 1, (n,), generator=g)
+    """Random clips ``[n, CLIP_FRAMES, 3, 64, 64]`` and their torques, or ``None``."""
+    episodes, frames = data["video"].shape[:2]
+    idx = torch.randint(episodes, (n,), generator=g)
+    start = torch.randint(frames - CLIP_FRAMES + 1, (n,), generator=g)
     t = start[:, None] + torch.arange(CLIP_FRAMES)
-    return to_float(data["video"][idx[:, None], t])
+    actions = data["action"][idx[:, None], t] if data["action"].any() else None
+    return to_float(data["video"][idx[:, None], t]), actions
 
 
 def train(kind, model, data, args, ckpt: Path) -> dict:
@@ -274,7 +350,7 @@ def train(kind, model, data, args, ckpt: Path) -> dict:
     model.train()
     t0, running = time.time() - state["seconds"], 0.0
     for step in range(state["step"] + 1, args.steps + 1):
-        loss = loss_of(kind, model, sample_clips(data, args.batch, g))
+        loss = loss_of(kind, model, *sample_clips(data, args.batch, g))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -324,20 +400,30 @@ def true_states(kind, model, video) -> tuple[torch.Tensor, slice]:
 
 
 def step_fn(kind, model):
-    """One rollout step on the model's flattened state."""
+    """``step(state, actions, k)``: step ``k`` of a rollout on the flattened state.
+
+    ``actions`` ``[N, T, 1]`` are the episode's torques (or ``None``); the
+    step from frame ``ANCHOR + k`` uses the torque at that frame.
+    """
     if kind == "lewm":
         d = model.embed_dim
 
-        def step(s):
+        def step(s, actions, k):
             window = s.view(len(s), 3, d)
-            nxt = model.step(window)
+            acts = None
+            if actions is not None:
+                acts = actions[:, ANCHOR - 2 + k : ANCHOR + 1 + k].to(s.dtype)
+            nxt = model.step(window, acts)
             return torch.cat([window[:, 1:].flatten(1), nxt], dim=-1)
 
         return step
 
-    def step(s):
+    def step(s, actions, k):
         q, p = s.chunk(2, dim=-1)
-        q, p = model.flow(q, p, None)
+        u = None
+        if actions is not None:
+            u = model.action_encoder(actions[:, ANCHOR + k].to(s.dtype))
+        q, p = model.flow(q, p, u)
         return torch.cat([q, p], dim=-1)
 
     return step
@@ -351,13 +437,13 @@ def initial_state(kind, model, video):
     return torch.cat([z[:, ANCHOR], causal_momentum(z)], dim=-1)
 
 
-def rollout(kind, model, video, steps=HORIZON) -> torch.Tensor:
+def rollout(kind, model, video, actions=None, steps=HORIZON) -> torch.Tensor:
     """Predicted states ``[N, steps, S]`` for frames ``ANCHOR + 1 ..``."""
     s, step = initial_state(kind, model, video), step_fn(kind, model)
     out = []
     with torch.no_grad():
-        for _ in range(steps):
-            s = step(s)
+        for k in range(steps):
+            s = step(s, actions, k)
             out.append(s)
     return torch.stack(out, 1)
 
@@ -396,20 +482,25 @@ def r2(pred, true):
     return 1 - ((pred - true) ** 2).sum(0) / ((true - true.mean(0)) ** 2).sum(0)
 
 
-def log_volume(kind, model, video, ks=(1, 10, 30, 60)) -> dict:
-    """Mean log|det J| per dimension of the k-step rollout map, in float64."""
+def log_volume(kind, model, video, actions=None, ks=(1, 10, 30, 60)) -> dict:
+    """Mean log|det J| per dimension of the k-step rollout map, in float64.
+
+    The map is taken with respect to the starting state, under each episode's
+    own torques.
+    """
     s0 = initial_state(kind, model, video).double()
     model = model.double()
     step = step_fn(kind, model)
     out = {}
     for k in ks:
         values = []
-        for s in s0:
+        for i, s in enumerate(s0):
+            acts = None if actions is None else actions[i : i + 1].double()
 
-            def k_steps(x, k=k):
+            def k_steps(x, k=k, acts=acts):
                 x = x[None]
-                for _ in range(k):
-                    x = step(x)
+                for j in range(k):
+                    x = step(x, acts, j)
                 return x[0]
 
             jac = torch.autograd.functional.jacobian(k_steps, s)
@@ -428,7 +519,8 @@ def evaluate(kind, model, train_data, test_data) -> dict:
     x_test = x_test.flatten(0, 1)
     y_test = targets(test_data["state"][:, frames_test]).flatten(0, 1)
 
-    pred = rollout(kind, model, test_data["video"])
+    actions = test_data["action"] if test_data["action"].any() else None
+    pred = rollout(kind, model, test_data["video"], actions)
     future = targets(test_data["state"][:, ANCHOR + 1 : ANCHOR + 1 + HORIZON])
     results = {"true_frames": {}, "rollout": {}}
     for name, probe in probes.items():
@@ -444,7 +536,9 @@ def evaluate(kind, model, train_data, test_data) -> dict:
                 {"k": k + 1, "angle_r2": float(r[:2].mean()), "omega_r2": float(r[2])}
             )
         results["rollout"][name] = rows
-    results["log_volume_per_dim"] = log_volume(kind, model, test_data["video"][:6])
+    results["log_volume_per_dim"] = log_volume(
+        kind, model, test_data["video"][:6], None if actions is None else actions[:6]
+    )
     return results
 
 
@@ -453,7 +547,10 @@ def report(runs: list[Path]):
     for run in runs:
         res = json.loads((run / "results.json").read_text())
         ev = res["eval"]
-        print(f"\n{res['model']} ({res['train']['seconds'] / 60:.0f} min training)")
+        print(
+            f"\n{res['model']}, {res.get('task', 'conservative')} task "
+            f"({res['train']['seconds'] / 60:.0f} min training)"
+        )
         for name in ("knn", "linear"):
             roll = {r["k"]: r for r in ev["rollout"][name]}
             true = ev["true_frames"][name]
@@ -472,14 +569,15 @@ def report(runs: list[Path]):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--model", choices=("lehami", "phase-mlp", "lewm"))
+    parser.add_argument("--task", choices=tuple(TASKS), default="conservative")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--report", type=Path, nargs="+")
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--train-per-length", type=int, default=100)
-    parser.add_argument("--test-per-length", type=int, default=20)
+    parser.add_argument("--train-episodes", type=int, default=300)
+    parser.add_argument("--test-episodes", type=int, default=60)
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument(
         "--eval-only",
@@ -492,10 +590,10 @@ def main():
     if args.threads:
         torch.set_num_threads(args.threads)
     args.out.mkdir(parents=True, exist_ok=True)
-    train_data = make_episodes(args.train_per_length, seed=1000)
-    test_data = make_episodes(args.test_per_length, seed=2000)
+    train_data = make_episodes(args.train_episodes, 1000, args.task)
+    test_data = make_episodes(args.test_episodes, 2000, args.task)
     torch.manual_seed(args.seed)
-    model = build(args.model)
+    model = build(args.model, args.task)
     print(
         f"{args.model}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params, "
         f"{len(train_data['video'])} train episodes",
@@ -512,6 +610,7 @@ def main():
         json.dumps(
             {
                 "model": args.model,
+                "task": args.task,
                 "args": {k: str(v) for k, v in vars(args).items()},
                 "train": state,
                 "eval": results,
