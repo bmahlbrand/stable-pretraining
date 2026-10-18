@@ -21,7 +21,10 @@ Evaluation rolls each model out for 60 steps from frame 3 of held-out
 episodes, without seeing any further frame, and reports:
 
 - R^2 of the angular velocity and the angle read from the predicted state by
-  ridge probes fit on the model's states of real training frames.
+  probes fit on the model's states of real training frames, with the paper's
+  two probes: distance-weighted 25-nearest-neighbour regression (the headline
+  read-out, since the latents encode velocity nonlinearly) and ridge
+  regression on raw features (alpha = 1).
 - Log-determinant per dimension of the Jacobian of the k-step rollout map in
   the model's own state space: 0 means volume is preserved, negative means
   the rollout contracts the latent distribution.
@@ -364,15 +367,29 @@ def targets(state: torch.Tensor) -> torch.Tensor:
     return torch.stack([theta.sin(), theta.cos(), omega], dim=-1)
 
 
-def fit_ridge(x, y, lam=1e-2):
-    mean, std = x.mean(0), x.std(0) + 1e-6
-    xs = torch.cat([(x - mean) / std, torch.ones(len(x), 1)], dim=1).double()
+def fit_ridge(x, y, alpha=1.0):
+    """Ridge regression on raw features with an unpenalized intercept."""
+    x_mean, y_mean = x.double().mean(0), y.double().mean(0)
+    xc = x.double() - x_mean
     w = torch.linalg.solve(
-        xs.T @ xs + lam * torch.eye(xs.shape[1], dtype=torch.float64), xs.T @ y.double()
+        xc.T @ xc + alpha * torch.eye(x.shape[1], dtype=torch.float64),
+        xc.T @ (y.double() - y_mean),
     )
-    return lambda z: (
-        torch.cat([(z - mean) / std, torch.ones(len(z), 1)], dim=1).double() @ w
-    ).float()
+    return lambda z: ((z.double() - x_mean) @ w + y_mean).float()
+
+
+def fit_knn(x, y, k=25):
+    """Distance-weighted k-nearest-neighbour regression on raw features."""
+
+    def predict(z):
+        out = []
+        for i in range(0, len(z), 1024):
+            dist, idx = torch.cdist(z[i : i + 1024], x).topk(k, largest=False)
+            w = 1 / dist.clamp_min(1e-12)
+            out.append((w[..., None] * y[idx]).sum(1) / w.sum(1, keepdim=True))
+        return torch.cat(out)
+
+    return predict
 
 
 def r2(pred, true):
@@ -405,56 +422,51 @@ def log_volume(kind, model, video, ks=(1, 10, 30, 60)) -> dict:
 def evaluate(kind, model, train_data, test_data) -> dict:
     model.eval()
     x, frames = true_states(kind, model, train_data["video"])
-    y = targets(train_data["state"][:, frames])
-    probe = fit_ridge(x.flatten(0, 1), y.flatten(0, 1))
+    x, y = x.flatten(0, 1), targets(train_data["state"][:, frames]).flatten(0, 1)
+    probes = {"knn": fit_knn(x, y), "linear": fit_ridge(x, y)}
     x_test, frames_test = true_states(kind, model, test_data["video"])
-    y_test = targets(test_data["state"][:, frames_test])
-    true_r2 = r2(probe(x_test.flatten(0, 1)), y_test.flatten(0, 1))
+    x_test = x_test.flatten(0, 1)
+    y_test = targets(test_data["state"][:, frames_test]).flatten(0, 1)
 
     pred = rollout(kind, model, test_data["video"])
     future = targets(test_data["state"][:, ANCHOR + 1 : ANCHOR + 1 + HORIZON])
-    per_k = []
-    for k in range(HORIZON):
-        r = r2(probe(pred[:, k]), future[:, k])
-        per_k.append(
-            {"k": k + 1, "angle_r2": float(r[:2].mean()), "omega_r2": float(r[2])}
-        )
-    volume = log_volume(kind, model, test_data["video"][:6])
-    return {
-        "true_frames": {
-            "angle_r2": float(true_r2[:2].mean()),
-            "omega_r2": float(true_r2[2]),
-        },
-        "rollout": per_k,
-        "log_volume_per_dim": volume,
-    }
+    results = {"true_frames": {}, "rollout": {}}
+    for name, probe in probes.items():
+        r = r2(probe(x_test), y_test)
+        results["true_frames"][name] = {
+            "angle_r2": float(r[:2].mean()),
+            "omega_r2": float(r[2]),
+        }
+        rows = []
+        for k in range(HORIZON):
+            r = r2(probe(pred[:, k]), future[:, k])
+            rows.append(
+                {"k": k + 1, "angle_r2": float(r[:2].mean()), "omega_r2": float(r[2])}
+            )
+        results["rollout"][name] = rows
+    results["log_volume_per_dim"] = log_volume(kind, model, test_data["video"][:6])
+    return results
 
 
 def report(runs: list[Path]):
     ks = (1, 5, 10, 20, 40, 60)
-    rows = []
     for run in runs:
         res = json.loads((run / "results.json").read_text())
-        roll = {r["k"]: r for r in res["eval"]["rollout"]}
-        rows.append((res["model"], res))
-        print(
-            f"\n{res['model']}: true frames angle R2 {res['eval']['true_frames']['angle_r2']:.3f}, "
-            f"omega R2 {res['eval']['true_frames']['omega_r2']:.3f}, "
-            f"{res['train']['seconds'] / 60:.0f} min"
-        )
-        print(
-            "  omega R2 by step: "
-            + " ".join(f"k{k}={roll[k]['omega_r2']:.2f}" for k in ks)
-        )
-        print(
-            "  angle R2 by step: "
-            + " ".join(f"k{k}={roll[k]['angle_r2']:.2f}" for k in ks)
-        )
-        vol = res["eval"]["log_volume_per_dim"]
-        print(
-            "  log|det J| / dim: "
-            + " ".join(f"k{k}={float(v):+.3f}" for k, v in vol.items())
-        )
+        ev = res["eval"]
+        print(f"\n{res['model']} ({res['train']['seconds'] / 60:.0f} min training)")
+        for name in ("knn", "linear"):
+            roll = {r["k"]: r for r in ev["rollout"][name]}
+            true = ev["true_frames"][name]
+            print(
+                f"  {name:6s} probe, real frames: angle R2 {true['angle_r2']:.2f}, "
+                f"omega R2 {true['omega_r2']:.2f}"
+            )
+            for key, label in (("omega_r2", "omega"), ("angle_r2", "angle")):
+                cells = " ".join(f"k{k}={roll[k][key]:.2f}" for k in ks)
+                print(f"    {label} R2 by step: {cells}")
+        vol = ev["log_volume_per_dim"]
+        cells = " ".join(f"k{k}={float(v):+.3f}" for k, v in vol.items())
+        print(f"  log|det J| / dim: {cells}")
 
 
 def main():
@@ -469,6 +481,11 @@ def main():
     parser.add_argument("--train-per-length", type=int, default=100)
     parser.add_argument("--test-per-length", type=int, default=20)
     parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Re-score a finished run from <out>/ckpt.pt; keeps its training log.",
+    )
     args = parser.parse_args()
     if args.report:
         return report(args.report)
@@ -484,7 +501,12 @@ def main():
         f"{len(train_data['video'])} train episodes",
         flush=True,
     )
-    state = train(args.model, model, train_data, args, args.out / "ckpt.pt")
+    if args.eval_only:
+        saved = torch.load(args.out / "ckpt.pt", weights_only=False)
+        model.load_state_dict(saved["model"])
+        state = saved["state"]
+    else:
+        state = train(args.model, model, train_data, args, args.out / "ckpt.pt")
     results = evaluate(args.model, model, train_data, test_data)
     (args.out / "results.json").write_text(
         json.dumps(
