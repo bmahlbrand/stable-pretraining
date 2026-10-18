@@ -5,7 +5,7 @@ Balestriero & LeCun, 2026) on the paper's two pendulum settings, rendered as
 64x64 frames with the rod drawn to scale:
 
 - ``--task conservative``: a frictionless pendulum with one of three rod
-  lengths, sampled at 20 Hz.
+  lengths, sampled at 20 Hz (the paper's multi-rod runs use 10 Hz).
 - ``--task actuated``: the swing-up setting. Three rod lengths times three bob
   masses (bob size shows the mass), driven by a random torque held for three
   frames, ``theta'' = -(g / L) sin(theta) + u / (m L^2)``, sampled at 10 Hz.

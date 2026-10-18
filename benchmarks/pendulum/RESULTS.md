@@ -33,6 +33,10 @@ read-out.
 
 ## Conservative pendulum (three rod lengths, 20 Hz)
 
+The rod lengths follow the paper's multi-rod set; the sampling rate is that of
+its single-rod set (the paper's multi-rod runs use 10 Hz), so one of our steps
+is half a paper step.
+
 Angular-velocity R² of decoded rollouts, nearest-neighbour probe:
 
 | Steps ahead | 1 | 10 | 20 | 40 | 60 |
@@ -40,7 +44,19 @@ Angular-velocity R² of decoded rollouts, nearest-neighbour probe:
 | `lehami` | 0.92 | 0.97 | **0.88** | **0.79** | **0.41** |
 | `phase-mlp` | 0.93 | 0.95 | 0.76 | -0.19 | -0.10 |
 | `lewm` | 0.81 | 0.97 | 0.87 | -0.59 | -0.39 |
-| Paper, LeHami (GPU, 100 epochs) | 0.98 | 0.94 | 0.74 | 0.09 | - |
+
+Against the paper's LeHami at the same elapsed time (its nearest-neighbour
+probe on its own 10 Hz multi-rod runs, three seeds, GPU, 100 epochs):
+
+| Time ahead | 0.5 s | 1 s | 2 s | 3 s | 4 s |
+|---|---|---|---|---|---|
+| Paper, LeHami | 0.97 | 0.94 | 0.74 | - | 0.09 |
+| This run, `lehami` | 0.97 | 0.88 | 0.79 | 0.41 | - |
+
+This CPU run reproduces the paper's numbers; it does not exceed them. The
+paper's LeWM baseline is not comparable here: its probe reads a single
+frame's latent, which cannot hold velocity, while our `lewm` probe reads its
+three-frame window.
 
 Angle R² (sin and cos), nearest-neighbour probe:
 
@@ -57,9 +73,9 @@ in each model's own state (0 = preserved, negative = contracted):
 |---|---|---|---|---|
 | `lehami` | 0.000 | 0.000 | 0.000 | 0.000 |
 | `phase-mlp` | -0.03 | -0.36 | -1.12 | -2.32 |
-| `lewm` | -0.82 | -7.76 | -21.77 | -32.25 |
+| `lewm` | -0.82 | -7.76 | -22.79 | -45.16 |
 
-- All three track the pendulum about equally well for 10-20 steps.
+- All three track the pendulum about equally well for 10-20 steps (0.5-1 s).
 - Beyond that only LeHami keeps reading out velocity and angle; the two
   unconstrained predictors fall to or below the mean-prediction baseline.
 - LeHami's volume is exactly preserved by construction; both unconstrained
