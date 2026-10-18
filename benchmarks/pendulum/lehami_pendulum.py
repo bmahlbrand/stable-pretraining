@@ -86,6 +86,8 @@ TASKS = {
         "u_max": 0.0,
         "hold": 1,
         "max_bob_r": 4.0,
+        # as the paper's conservative multi-rod model
+        "sigreg_on": "joint",
     },
     "actuated": {
         "dt": 0.1,
@@ -94,6 +96,8 @@ TASKS = {
         "u_max": 4.0,
         "hold": 3,
         "max_bob_r": 6.0,
+        # as the paper's main actuated model
+        "sigreg_on": "q",
     },
 }
 
@@ -290,7 +294,7 @@ class LeWMStyle(nn.Module):
         return torch.stack(losses).mean() + 0.25 * sigreg
 
 
-def build(kind: str, task_name: str) -> nn.Module:
+def build(kind: str, task_name: str, sigreg_on: str = None) -> nn.Module:
     encoder = conv_encoder()
     action_dim = 1 if TASKS[task_name]["u_max"] else 0
     if kind == "lewm":
@@ -302,7 +306,7 @@ def build(kind: str, task_name: str) -> nn.Module:
         encoder_dim=128,
         flow_hidden_dim=512,
         lamb=0.25,
-        sigreg_on="joint",
+        sigreg_on=sigreg_on or TASKS[task_name]["sigreg_on"],
     )
     if kind == "phase-mlp":
         model.flow = ResidualPhaseFlow(
@@ -569,6 +573,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--model", choices=("lehami", "phase-mlp", "lewm"))
     parser.add_argument("--task", choices=tuple(TASKS), default="conservative")
+    parser.add_argument(
+        "--sigreg-on",
+        choices=("q", "joint"),
+        default=None,
+        help="Override the task's SIGReg placement for lehami / phase-mlp.",
+    )
     parser.add_argument("--out", type=Path)
     parser.add_argument("--report", type=Path, nargs="+")
     parser.add_argument("--steps", type=int, default=3000)
@@ -592,7 +602,7 @@ def main():
     train_data = make_episodes(args.train_episodes, 1000, args.task)
     test_data = make_episodes(args.test_episodes, 2000, args.task)
     torch.manual_seed(args.seed)
-    model = build(args.model, args.task)
+    model = build(args.model, args.task, args.sigreg_on)
     print(
         f"{args.model}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params, "
         f"{len(train_data['video'])} train episodes",
