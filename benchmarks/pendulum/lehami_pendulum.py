@@ -100,6 +100,9 @@ TASKS = {
         "sigreg_on": "q",
     },
 }
+# Same torques, but only episodes that never pass over the top: tests whether
+# full rotations, which a potential V(q, u) cannot represent, are what hurts.
+TASKS["actuated-noflip"] = {**TASKS["actuated"], "no_flip": True}
 
 
 def simulate(theta, omega, length, mass, actions, task) -> np.ndarray:
@@ -162,18 +165,23 @@ def make_episodes(episodes: int, seed: int, task_name: str) -> dict:
     for length, mass in cells:
         rod_px, bob_r = geometry(length, mass, task)
         for _ in range(per_cell):
-            theta = rng.uniform(-math.pi, math.pi)
-            omega = rng.uniform(-OMEGA_BOUND, OMEGA_BOUND) * math.sqrt(G / length)
-            u = np.zeros(task["frames"], dtype=np.float32)
-            if task["u_max"]:
-                blocks = rng.uniform(
-                    -task["u_max"],
-                    task["u_max"],
-                    math.ceil(task["frames"] / task["hold"]),
-                )
-                u = np.repeat(blocks, task["hold"])[: task["frames"]].astype(np.float32)
-                u[-1] = 0.0
-            state = simulate(theta, omega, length, mass, u, task)
+            while True:
+                theta = rng.uniform(-math.pi, math.pi)
+                omega = rng.uniform(-OMEGA_BOUND, OMEGA_BOUND) * math.sqrt(G / length)
+                u = np.zeros(task["frames"], dtype=np.float32)
+                if task["u_max"]:
+                    blocks = rng.uniform(
+                        -task["u_max"],
+                        task["u_max"],
+                        math.ceil(task["frames"] / task["hold"]),
+                    )
+                    u = np.repeat(blocks, task["hold"])[: task["frames"]]
+                    u = u.astype(np.float32)
+                    u[-1] = 0.0
+                state = simulate(theta, omega, length, mass, u, task)
+                # resample until the pendulum never passes over the top
+                if not task.get("no_flip") or np.abs(state[:, 0]).max() < math.pi:
+                    break
             videos.append(
                 np.stack([render(float(a), rod_px, bob_r) for a in state[:, 0]])
             )
