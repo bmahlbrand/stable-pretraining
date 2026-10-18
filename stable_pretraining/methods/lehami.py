@@ -18,9 +18,6 @@ References:
     Yalovetzky, Balestriero & LeCun. "LeHami: Symplectic Latent Dynamics for
     World Models." 2026. https://github.com/rominay/LeHami
 
-    Chen et al. "Symplectic Recurrent Neural Networks." ICLR 2020.
-    https://arxiv.org/abs/1909.13334
-
 Example::
 
     import torch
