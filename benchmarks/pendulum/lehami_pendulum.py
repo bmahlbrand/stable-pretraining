@@ -486,28 +486,27 @@ def log_volume(kind, model, video, actions=None, ks=(1, 10, 30, 60)) -> dict:
     """Mean log|det J| per dimension of the k-step rollout map, in float64.
 
     The map is taken with respect to the starting state, under each episode's
-    own torques.
+    own torques. By the chain rule its log-determinant is the sum of the
+    one-step log-determinants along the rollout, so one pass gives every k.
     """
     s0 = initial_state(kind, model, video).double()
     model = model.double()
     step = step_fn(kind, model)
-    out = {}
-    for k in ks:
-        values = []
-        for i, s in enumerate(s0):
-            acts = None if actions is None else actions[i : i + 1].double()
+    totals = np.zeros((len(s0), max(ks)))
+    for i, s in enumerate(s0):
+        acts = None if actions is None else actions[i : i + 1].double()
+        for j in range(max(ks)):
 
-            def k_steps(x, k=k, acts=acts):
-                x = x[None]
-                for j in range(k):
-                    x = step(x, acts, j)
-                return x[0]
+            def one_step(x, j=j, acts=acts):
+                return step(x[None], acts, j)[0]
 
-            jac = torch.autograd.functional.jacobian(k_steps, s)
-            values.append(torch.linalg.slogdet(jac)[1].item() / len(s))
-        out[k] = float(np.mean(values))
+            jac = torch.autograd.functional.jacobian(one_step, s)
+            totals[i, j] = torch.linalg.slogdet(jac)[1].item() / len(s)
+            with torch.no_grad():
+                s = one_step(s)
     model.float()
-    return out
+    cumulative = totals.cumsum(1).mean(0)
+    return {k: float(cumulative[k - 1]) for k in ks}
 
 
 def evaluate(kind, model, train_data, test_data) -> dict:
