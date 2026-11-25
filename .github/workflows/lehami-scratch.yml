@@ -27,14 +27,16 @@ jobs:
         env:
           OMP_NUM_THREADS: "2"
         run: |
-          set -o pipefail
+          set +e -o pipefail
+          status=0
           if [ "${{ matrix.suite }}" = lehami ]; then
-            python -c "import stable_pretraining as spt; spt.LeHami; from stable_pretraining.losses import LeHamiLoss; print('imports ok')" 2>&1 | tee out.txt
-            pytest stable_pretraining/tests/unit/test_lehami.py -v -rA 2>&1 | tee -a out.txt
-            pytest stable_pretraining/tests/distributed/test_lehami_dist.py -m distributed -v -rA 2>&1 | tee -a out.txt
+            python -c "import stable_pretraining as spt; spt.LeHami; spt.forward.lehami; from stable_pretraining.losses import LeHamiLoss; print('imports ok')" 2>&1 | tee out.txt || status=1
+            pytest stable_pretraining/tests/unit/test_lehami.py -v -rfE 2>&1 | tee -a out.txt || status=1
+            pytest stable_pretraining/tests/distributed/test_lehami_dist.py -m distributed -v -rfE 2>&1 | tee -a out.txt || status=1
           else
-            pytest stable_pretraining/ -m unit -q -rfE -p no:cacheprovider 2>&1 | tee out.txt
+            pytest stable_pretraining/ -m unit -q -rfE -p no:cacheprovider 2>&1 | tee out.txt || status=1
           fi
+          exit $status
       - name: Report
         if: always()
         env:
