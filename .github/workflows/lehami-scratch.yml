@@ -33,6 +33,10 @@ jobs:
             python -c "import stable_pretraining as spt; spt.LeHami; spt.forward.lehami; from stable_pretraining.losses import LeHamiLoss; print('imports ok')" 2>&1 | tee out.txt || status=1
             pytest stable_pretraining/tests/unit/test_lehami.py -v -rfE 2>&1 | tee -a out.txt || status=1
             pytest stable_pretraining/tests/distributed/test_lehami_dist.py -m distributed -v -rfE 2>&1 | tee -a out.txt || status=1
+            for m in lehami phase-mlp; do
+              python benchmarks/pendulum/lehami_pendulum.py --model $m --task actuated --out runs/$m \
+                --steps 2 --batch 4 --train-episodes 6 --test-episodes 2 2>&1 | tail -n 25 | tee -a out.txt || status=1
+            done
           else
             pytest stable_pretraining/ -m unit -q -rfE -p no:cacheprovider 2>&1 | tee out.txt || status=1
           fi
