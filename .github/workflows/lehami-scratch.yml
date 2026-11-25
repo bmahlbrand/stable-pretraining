@@ -1,0 +1,44 @@
+# Temporary: runs the LeHami tests on the scratch branch only. Not for merge.
+name: LeHami scratch tests
+on:
+  push:
+    branches: ["ci/lehami-tests"]
+permissions:
+  contents: write
+jobs:
+  lehami:
+    name: LeHami (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [lehami, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Test
+        env:
+          OMP_NUM_THREADS: "2"
+        run: |
+          set -o pipefail
+          if [ "${{ matrix.suite }}" = lehami ]; then
+            python -c "import stable_pretraining as spt; spt.LeHami; from stable_pretraining.losses import LeHamiLoss; print('imports ok')" 2>&1 | tee out.txt
+            pytest stable_pretraining/tests/unit/test_lehami.py -v -rA 2>&1 | tee -a out.txt
+            pytest stable_pretraining/tests/distributed/test_lehami_dist.py -m distributed -v -rA 2>&1 | tee -a out.txt
+          else
+            pytest stable_pretraining/ -m unit -q -rfE -p no:cacheprovider 2>&1 | tee out.txt
+          fi
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "### ${{ matrix.suite }}: ${{ job.status }}"; echo '```'; tail -c 60000 out.txt; echo '```'; } > body.md
+          gh api repos/${{ github.repository }}/commits/${{ github.sha }}/comments -F body=@body.md
