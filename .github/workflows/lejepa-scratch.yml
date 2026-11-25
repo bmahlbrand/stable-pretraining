@@ -1,0 +1,55 @@
+# Temporary: verifies the EppsPulley all_reduce fix on the scratch branch only.
+name: LeJEPA fix scratch tests
+on:
+  push:
+    branches: ["ci/lejepa-fix"]
+permissions:
+  contents: write
+jobs:
+  check:
+    name: LeJEPA fix (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [lejepa, unit]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev,trackio,swanlab]"
+      - name: Test
+        env:
+          OMP_NUM_THREADS: "2"
+        run: |
+          set +e -o pipefail
+          status=0
+          if [ "${{ matrix.suite }}" = lejepa ]; then
+            pytest stable_pretraining/tests/distributed/test_lejepa_dist.py stable_pretraining/tests/distributed/test_collectives_dist.py -m distributed -v -rfE 2>&1 | tee out.txt || status=1
+            pytest stable_pretraining/tests/unit/test_methods_smoke.py stable_pretraining/tests/unit/test_method_boundary_contracts.py -k "lejepa or LeJEPA" -v -rfE 2>&1 | tee -a out.txt || status=1
+            echo "=== control: new tests against the unfixed lejepa.py (must FAIL) ===" | tee -a out.txt
+            git show HEAD~2:stable_pretraining/methods/lejepa.py > stable_pretraining/methods/lejepa.py
+            if pytest stable_pretraining/tests/distributed/test_lejepa_dist.py -m distributed -q -rfE 2>&1 | tee -a out.txt; then
+              echo "CONTROL UNEXPECTEDLY PASSED" | tee -a out.txt; status=1
+            else
+              echo "CONTROL FAILED AS EXPECTED" | tee -a out.txt
+            fi
+            git checkout -- stable_pretraining/methods/lejepa.py
+          else
+            pytest stable_pretraining/ -m unit -q -rfE -p no:cacheprovider 2>&1 | tee out.txt || status=1
+          fi
+          exit $status
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "### ${{ matrix.suite }}: ${{ job.status }}"; echo '```'; tail -c 60000 out.txt; echo '```'; } > body.md
+          gh api repos/${{ github.repository }}/commits/${{ github.sha }}/comments -F body=@body.md
